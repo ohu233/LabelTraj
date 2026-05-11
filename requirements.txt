@@ -1,0 +1,79 @@
+asttokens==3.0.1
+Bottleneck @ file:///C:/miniconda3/conda-bld/bottleneck_1761938072950/work
+certifi==2026.2.25
+cloudpickle==3.1.2
+colorama==0.4.6
+comm==0.2.3
+contourpy==1.3.3
+cycler==0.12.1
+debugpy==1.8.20
+decorator==5.2.1
+et_xmlfile==2.0.0
+executing==2.2.1
+Farama-Notifications==0.0.4
+filelock==3.19.1
+fonttools==4.60.1
+fsspec==2025.9.0
+gym-notices==0.1.0
+gymnasium==1.2.2
+ipykernel==7.2.0
+ipython==9.11.0
+ipython_pygments_lexers==1.1.1
+jedi==0.19.2
+jieba==0.42.1
+Jinja2==3.1.6
+joblib==1.5.2
+jupyter_client==8.8.0
+jupyter_core==5.9.1
+kiwisolver==1.4.9
+lxml==6.1.0
+MarkupSafe==2.1.5
+matplotlib==3.10.7
+matplotlib-inline==0.2.1
+mkl-service==2.5.2
+mkl_fft @ file:///C:/miniconda3/conda-bld/mkl_fft_1761592917950/work
+mkl_random @ file:///C:/miniconda3/conda-bld/mkl_random_1761593166070/work
+mpmath==1.3.0
+nest-asyncio==1.6.0
+networkx==3.5
+numexpr @ file:///C:/Users/task_177627000745692/croot/numexpr_1776270103779/work
+numpy==2.3.3
+opencv-python==4.13.0.92
+openpyxl==3.1.5
+packaging==25.0
+pandas @ file:///C:/miniconda3/conda-bld/pandas_1762332401650/work/dist/pandas-2.3.3-cp312-cp312-win_amd64.whl#sha256=31f3f2ea38ad67d0e1e92b191f191182ac281491c0bbe0b8a2c362da578d5ab8
+parso==0.8.6
+pillow==11.3.0
+platformdirs==4.9.4
+prompt_toolkit==3.0.52
+psutil==7.2.2
+pure_eval==0.2.3
+py4j @ file:///C:/miniconda3/conda-bld/py4j_1758132885001/work
+pyarrow @ file:///C:/Users/task_177557227935187/croot/pyarrow_1775572627705/work/python
+pygame==2.6.1
+Pygments==2.19.2
+pyparsing==3.2.5
+pyproj==3.7.2
+pyspark @ file:///C:/Users/task_177564080064639/croot/pyspark_1775641605062/work
+python-dateutil @ file:///C:/b/abs_3au_koqnbs/croot/python-dateutil_1716495777160/work
+python-docx==1.2.0
+pytz==2025.2
+pyzmq==27.1.0
+scikit-learn==1.7.2
+scipy==1.16.3
+seaborn==0.13.2
+setuptools==80.9.0
+six @ file:///C:/b/abs_149wuyuo1o/croot/six_1744271521515/work
+stack-data==0.6.3
+sympy==1.14.0
+threadpoolctl==3.6.0
+torch==2.9.0+cu130
+torchvision==0.24.0+cu130
+tornado==6.5.5
+tqdm==4.67.1
+traitlets==5.14.3
+typing_extensions==4.15.0
+tzdata==2025.2
+wcwidth==0.6.0
+wheel==0.45.1
+wordcloud==1.9.6
