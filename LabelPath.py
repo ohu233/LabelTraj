@@ -183,12 +183,12 @@ def get_raw_point_df():
     return _RAW_POINT_DF
 
 
-def load_traj_csv_hex(path):
+def load_traj_csv_hex(path, sample_step=10):
     """读取六边形模式轨迹 CSV，按 uid 分组生成起终点记录。
 
     支持两种格式:
     1. 起终点格式: x_o,y_o,z_o,x_d,y_d,z_d,mode,order
-    2. 点序列格式: uid,hex_x,hex_y,hex_z,...  → 按 uid 分组，每7行采样生成段
+    2. 点序列格式: uid,hex_x,hex_y,hex_z,...  → 按 uid 分组，每 sample_step 行采样生成段
     """
     global _RAW_POINT_DF
     df = pd.read_csv(path)
@@ -198,8 +198,7 @@ def load_traj_csv_hex(path):
         records = []
         for uid, group in df.groupby("uid", sort=False):
             group = group.reset_index(drop=True)
-            # 每7行采样，生成连续段
-            sampled_indices = list(range(0, len(group), 1))
+            sampled_indices = list(range(0, len(group), sample_step))
             for i in range(len(sampled_indices) - 1):
                 a = group.iloc[sampled_indices[i]]
                 b = group.iloc[sampled_indices[i + 1]]
@@ -208,6 +207,17 @@ def load_traj_csv_hex(path):
                     int(a["hex_y"]) == int(b["hex_y"]) and
                     int(a["hex_z"]) == int(b["hex_z"])):
                     continue
+                # 间隔取行：对区间内的 time / dist 求和，velocity 重算
+                seg_rows = group.iloc[sampled_indices[i] + 1 : sampled_indices[i + 1] + 1]
+                time_sum = float(seg_rows["time_value"].sum()) if "time_value" in df.columns else 0.0
+                dist_sum = float(seg_rows["dist_value"].sum()) if "dist_value" in df.columns else 0.0
+                if time_sum > 0 and dist_sum > 0:
+                    velocity_d = dist_sum / time_sum * 3.6  # m/s → km/h
+                elif "velocity" in df.columns:
+                    velocity_d = float(b["velocity"])
+                else:
+                    velocity_d = 0.0
+
                 records.append({
                     "x_o": int(a["hex_x"]), "y_o": int(a["hex_y"]), "z_o": int(a["hex_z"]),
                     "x_d": int(b["hex_x"]), "y_d": int(b["hex_y"]), "z_d": int(b["hex_z"]),
@@ -218,9 +228,9 @@ def load_traj_csv_hex(path):
                     "stime_o": int(a["stime"]) if "stime" in df.columns else 0,
                     "lat_o": float(a["lat"]) if "lat" in df.columns else 0.0,
                     "lon_o": float(a["lon"]) if "lon" in df.columns else 0.0,
-                    "time_d": float(b["time_value"]) if "time_value" in df.columns else 0.0,
-                    "dist_d": float(b["dist_value"]) if "dist_value" in df.columns else 0.0,
-                    "velocity_d": float(b["velocity"]) if "velocity" in df.columns else 0.0,
+                    "time_d": time_sum,
+                    "dist_d": dist_sum,
+                    "velocity_d": velocity_d,
                 })
         return pd.DataFrame(records)
     return df
@@ -919,6 +929,8 @@ def main():
     parser.add_argument("--grid", type=str, default="hex",
                         choices=["quad", "hex"],
                         help="grid type: quad (1000m quadrilateral) or hex (200m hexagon)")
+    parser.add_argument("--sample-step", type=int, default=1,
+                        help="sampling interval for point-sequence CSV (default: 10)")
     args = parser.parse_args()
 
     is_hex = (args.grid == "hex")
@@ -935,7 +947,7 @@ def main():
         for m in MODE_LIST:
             print(f"  {m}: {len(road_sets[m]):,} cells")
         print("Loading trajectory data...")
-        traj_df = load_traj_csv_hex(args.csv)
+        traj_df = load_traj_csv_hex(args.csv, sample_step=args.sample_step)
         print(f"Total trajectories: {len(traj_df)}")
 
         def make_state(row):
