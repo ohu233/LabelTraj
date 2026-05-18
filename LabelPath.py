@@ -20,6 +20,15 @@ import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+# ---------------------------------------------------------------------------
+from utils.geo_utils import (
+    grid_to_mercator,
+    grid_bounds_to_mercator,
+    full_grid_bounds_mercator,
+    mercator_to_grid,
+)
+from utils.basemap import add_osm_basemap, USE_OSM_BASEMAP
+
 from utils.tools import mapdata_to_modelmatrix, calculate_match_rate
 
 # ========================== Constants ==========================
@@ -31,7 +40,7 @@ MAP_ROWS = 529
 MAP_COLS = 564
 
 MODE_COLORS = {
-    "TG": "orange",
+    "TG": "purple",
     "GG": "blue",
     "GSD": "green",
     "TS": "red",
@@ -167,49 +176,10 @@ class PathRenderer:
     def __init__(self, state: LabelState, raw_mapdata: dict):
         self.state = state
 
-        self.fig, self.ax = plt.subplots(figsize=(10, 8))
+        self.fig, self.ax = plt.subplots(figsize=(12, 9))
         self.fig.canvas.manager.set_window_title("LabelPath — Interactive Path Labeling")
 
-        # ---- road network: continuous RGB image, one color per mode ----
-        road_rgb = self._build_road_rgb(raw_mapdata)  # shape (529, 564, 3)
-        self.ax.imshow(
-            road_rgb,
-            extent=[0, MAP_COLS, 0, MAP_ROWS],
-            origin="lower",
-            alpha=0.45,
-            zorder=1,
-        )
-
-        # ---- start / end markers ----
-        self.start_handle = self.ax.scatter(
-            state.start_x, state.start_y,
-            c="limegreen", marker="o", s=180,
-            edgecolors="darkgreen", linewidths=2,
-            zorder=5, label="Start",
-        )
-        self.end_handle = self.ax.scatter(
-            state.end_x, state.end_y,
-            c="red", marker="X", s=180,
-            edgecolors="darkred", linewidths=2,
-            zorder=5, label="End",
-        )
-
-        # ---- path trail (initially empty) ----
-        (self.path_line,) = self.ax.plot(
-            [], [], "-",
-            color="crimson", linewidth=2.5, alpha=0.85,
-            zorder=3, label="Path",
-        )
-
-        # ---- cursor (small ring so roads are visible underneath) ----
-        self.cursor = self.ax.scatter(
-            state.cur_x, state.cur_y,
-            c="cyan", marker="o", s=25,
-            edgecolors="darkblue", linewidths=1.5,
-            zorder=6, label="Cursor",
-        )
-
-        # ---- viewport crop around start-end ----
+        # ---- 计算视口范围（网格坐标）----
         x_vals = [state.start_x, state.end_x]
         y_vals = [state.start_y, state.end_y]
         x_center = (min(x_vals) + max(x_vals)) / 2
@@ -217,27 +187,81 @@ class PathRenderer:
         x_range = max(abs(max(x_vals) - min(x_vals)), 20)
         y_range = max(abs(max(y_vals) - min(y_vals)), 20)
 
-        self.ax.set_xlim(
-            max(0, x_center - x_range / 2 - VIEW_PADDING),
-            min(MAP_COLS, x_center + x_range / 2 + VIEW_PADDING),
+        grid_xmin = max(0, x_center - x_range / 2 - VIEW_PADDING)
+        grid_xmax = min(MAP_COLS, x_center + x_range / 2 + VIEW_PADDING)
+        grid_ymin = max(0, y_center - y_range / 2 - VIEW_PADDING)
+        grid_ymax = min(MAP_ROWS, y_center + y_range / 2 + VIEW_PADDING)
+
+        # ---- 转换视口边界到 Mercator 并设置底图 ----
+        mx_min, mx_max, my_min, my_max = grid_bounds_to_mercator(
+            grid_xmin, grid_xmax, grid_ymin, grid_ymax
         )
-        self.ax.set_ylim(
-            max(0, y_center - y_range / 2 - VIEW_PADDING),
-            min(MAP_ROWS, y_center + y_range / 2 + VIEW_PADDING),
+        self.ax.set_xlim(mx_min, mx_max)
+        self.ax.set_ylim(my_min, my_max)
+        self.ax.set_aspect("equal")
+
+        if USE_OSM_BASEMAP:
+            try:
+                add_osm_basemap(self.ax, alpha=0.8)
+            except Exception as e:
+                print(f"  [WARN] OSM basemap load failed: {e}")
+                print(f"  [WARN] Falling back to road-network overlay only")
+
+        # ---- 道路网络彩色叠加层（Mercator 坐标系）----
+        road_rgb = self._build_road_rgb(raw_mapdata)  # shape (529, 564, 3)
+        full_mx_min, full_mx_max, full_my_min, full_my_max = full_grid_bounds_mercator()
+        self.ax.imshow(
+            road_rgb,
+            extent=[full_mx_min, full_mx_max, full_my_min, full_my_max],
+            origin="lower",
+            alpha=0.45,
+            zorder=2,
         )
 
-        self.ax.set_xlabel("X")
-        self.ax.set_ylabel("Y")
-        self.ax.grid(True, alpha=0.3)
+        # ---- 起终点标记（Mercator 坐标）----
+        start_mx, start_my = grid_to_mercator(state.start_x, state.start_y)
+        end_mx, end_my = grid_to_mercator(state.end_x, state.end_y)
 
-        # ---- mode color legend ----
+        self.start_handle = self.ax.scatter(
+            start_mx, start_my,
+            c="limegreen", marker="o", s=180,
+            edgecolors="darkgreen", linewidths=2,
+            zorder=5, label="Start",
+        )
+        self.end_handle = self.ax.scatter(
+            end_mx, end_my,
+            c="red", marker="X", s=180,
+            edgecolors="darkred", linewidths=2,
+            zorder=5, label="End",
+        )
+
+        # ---- 路径轨迹（初始为空）----
+        (self.path_line,) = self.ax.plot(
+            [], [], "-",
+            color="crimson", linewidth=2.5, alpha=0.85,
+            zorder=3, label="Path",
+        )
+
+        # ---- 光标（Mercator 坐标）----
+        cursor_mx, cursor_my = grid_to_mercator(state.cur_x, state.cur_y)
+        self.cursor = self.ax.scatter(
+            cursor_mx, cursor_my,
+            c="cyan", marker="o", s=25,
+            edgecolors="darkblue", linewidths=1.5,
+            zorder=6, label="Cursor",
+        )
+
+        self.ax.set_xlabel("Web Mercator X (EPSG:3857)")
+        self.ax.set_ylabel("Web Mercator Y (EPSG:3857)")
+        self.ax.grid(False)
+
+        # ---- 出行模式颜色图例 ----
         mode_handles = [
-            Line2D([0], [0], color="orange", lw=3, label="TG"),
+            Line2D([0], [0], color="purple", lw=3, label="TG"),
             Line2D([0], [0], color="blue", lw=3, label="GG"),
             Line2D([0], [0], color="green", lw=3, label="GSD"),
             Line2D([0], [0], color="red", lw=3, label="TS"),
         ]
-        # Merge with existing handles (start/end/path/cursor)
         handles, labels = self.ax.get_legend_handles_labels()
         self.ax.legend(handles=mode_handles + handles, loc="upper right")
 
@@ -246,40 +270,55 @@ class PathRenderer:
 
         self.fig.tight_layout()
 
-    def _build_road_rgb(self, raw_mapdata):
-        """Build an RGB image (529, 564, 3) from all 4 mode grids.
-        Each mode contributes its color; overlapping pixels are blended.
-        Background = white.  Transposed for imshow: horizontal=x, vertical=y.
+    def _build_road_rgb(self, raw_mapdata, resolution=500):
+        """Build an RGB image resampled to a regular Mercator (EPSG:3857) grid.
+
+        The Beijing 1954 GK grid is rotated ~4.5° relative to the Mercator
+        axes at this longitude.  A plain imshow with a rectangular extent
+        cannot represent that rotation, producing km-scale offsets from OSM
+        tiles.  Resampling onto a regular Mercator grid fixes the alignment.
         """
         matrices = mapdata_to_modelmatrix(raw_mapdata, MAP_ROWS, MAP_COLS)
 
-        # RGB color for each mode
+        # ---- build the full-resolution source grid (564, 529) ----
         mode_rgb = {
-            "TG":  (1.00, 0.65, 0.00),  # orange
+            "TG":  (0.65, 0.00, 0.65),  # purple
             "GG":  (0.00, 0.45, 1.00),  # blue
             "GSD": (0.00, 0.75, 0.00),  # green
             "TS":  (1.00, 0.00, 0.00),  # red
         }
 
-        # Start with white background, shape (564, 529, 3)
-        rgb = np.ones((MAP_COLS, MAP_ROWS, 3), dtype=np.float32)
-
+        src = np.ones((MAP_COLS, MAP_ROWS, 3), dtype=np.float32)
         for mode_name in MODE_LIST:
             if mode_name not in matrices:
                 continue
-            grid = np.array(matrices[mode_name], dtype=np.float32)  # (564, 529)
-            mask = grid > 0
+            layer = np.array(matrices[mode_name], dtype=np.float32)
+            mask = layer > 0
             if not mask.any():
                 continue
             r, g, b = mode_rgb.get(mode_name, (0.5, 0.5, 0.5))
-            # Blend: take the mode color where this mode exists
-            rgb[mask, 0] = np.minimum(rgb[mask, 0], r)
-            rgb[mask, 1] = np.minimum(rgb[mask, 1], g)
-            rgb[mask, 2] = np.minimum(rgb[mask, 2], b)
+            src[mask, 0] = np.minimum(src[mask, 0], r)
+            src[mask, 1] = np.minimum(src[mask, 1], g)
+            src[mask, 2] = np.minimum(src[mask, 2], b)
 
-        # Transpose to (529, 564, 3) for imshow
-        rgb = rgb.transpose(1, 0, 2)
-        return rgb
+        # ---- Mercator target grid ----
+        mx_min, mx_max, my_min, my_max = full_grid_bounds_mercator()
+        ncols = max(1, int((mx_max - mx_min) / resolution))
+        nrows = max(1, int((my_max - my_min) / resolution))
+
+        # pixel *centers* in Mercator (so extent is simply [mx_min, mx_max, …])
+        merc_x = mx_min + (np.arange(ncols) + 0.5) * (mx_max - mx_min) / ncols
+        merc_y = my_min + (np.arange(nrows) + 0.5) * (my_max - my_min) / nrows
+        merc_xg, merc_yg = np.meshgrid(merc_x, merc_y)  # (nrows, ncols)
+
+        # back-project to grid indices
+        gx, gy = mercator_to_grid(merc_xg, merc_yg)
+        gx_idx = np.clip(np.round(gx).astype(int), 0, MAP_COLS - 1)
+        gy_idx = np.clip(np.round(gy).astype(int), 0, MAP_ROWS - 1)
+
+        # nearest-neighbour sample from the source grid  src[col, row]
+        sampled = src[gx_idx, gy_idx]  # (nrows, ncols, 3)
+        return sampled
 
     def _update_title(self):
         state = self.state
@@ -317,12 +356,15 @@ class PathRenderer:
         self.fig.canvas.draw_idle()
 
     def refresh(self):
-        """Incremental update: path line + cursor position."""
+        """Incremental update: path line + cursor position (Mercator)."""
         state = self.state
         xs = [p[0] for p in state.path_history]
         ys = [p[1] for p in state.path_history]
-        self.path_line.set_data(xs, ys)
-        self.cursor.set_offsets([[state.cur_x, state.cur_y]])
+        merc_x, merc_y = grid_to_mercator(xs, ys)
+        self.path_line.set_data(merc_x, merc_y)
+
+        cursor_mx, cursor_my = grid_to_mercator(state.cur_x, state.cur_y)
+        self.cursor.set_offsets([[cursor_mx, cursor_my]])
         self._update_title()
         self.fig.canvas.draw_idle()
 
