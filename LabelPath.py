@@ -20,24 +20,71 @@ import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+
+# 禁用 matplotlib 默认快捷键，避免与标注操作冲突
+matplotlib.rcParams["keymap.quit"] = []
+matplotlib.rcParams["keymap.quit_all"] = []
+matplotlib.rcParams["keymap.save"] = []
+matplotlib.rcParams["keymap.fullscreen"] = []
+matplotlib.rcParams["keymap.home"] = []
+matplotlib.rcParams["keymap.back"] = []
+matplotlib.rcParams["keymap.forward"] = []
+matplotlib.rcParams["keymap.pan"] = []
+matplotlib.rcParams["keymap.zoom"] = []
+matplotlib.rcParams["keymap.grid"] = []
+matplotlib.rcParams["keymap.xscale"] = []
+matplotlib.rcParams["keymap.yscale"] = []
 # ---------------------------------------------------------------------------
 from utils.geo_utils import (
     grid_to_mercator,
     grid_bounds_to_mercator,
     full_grid_bounds_mercator,
     mercator_to_grid,
+    wgs84_to_hex,
+    hex_to_wgs84,
+    hex_to_mercator,
+    hex_neighbors,
+    hex_distance,
+    hex_in_map,
+    _init_hex_origin,
 )
 from utils.basemap import add_osm_basemap, USE_OSM_BASEMAP
 
-from utils.tools import mapdata_to_modelmatrix, calculate_match_rate
+from utils.tools import (
+    mapdata_to_modelmatrix,
+    calculate_match_rate,
+    HEX_MODE_BITS,
+    hex_mapdata_to_road_sets,
+    build_multi_mapdata_hex,
+    calculate_match_rate_hex,
+)
 
 # ========================== Constants ==========================
+
+# ========================== Quad Grid Constants ==========================
 
 DX_DY = {0: (1, 0), 1: (0, 1), 2: (-1, 0), 3: (0, -1)}
 #         right     up        left       down
 
 MAP_ROWS = 529
 MAP_COLS = 564
+
+# ========================== Hex Grid Constants ==========================
+
+# 六方向向量（平顶六边形立方体坐标）
+HEX_DIRS = {
+    0: (1, -1, 0),   # E  / 右
+    1: (1, 0, -1),   # NE / 东北
+    2: (0, 1, -1),   # NW / 西北/上
+    3: (-1, 1, 0),   # W  / 左
+    4: (-1, 0, 1),   # SW / 西南
+    5: (0, -1, 1),   # SE / 东南/下
+}
+
+VIEW_PADDING_METERS = 6000  # hex 模式视口边距（Mercator 米）
+HEX_PKL_PATH = "map-processor/hex_grid.pkl"
+
+# ========================== Shared Constants ==========================
 
 MODE_COLORS = {
     "TG": "purple",
@@ -48,7 +95,7 @@ MODE_COLORS = {
 MODE_LIST = ["GSD", "GG", "TS", "TG"]
 
 DEFAULT_MAPDATA_PATH = "data/GridModesAdjacentRealworld.pkl"
-DEFAULT_CSV_PATH = "data/data_lower_test.csv"
+DEFAULT_CSV_PATH = "data/dataset518_with_hex.csv"
 DEFAULT_OUTPUT_DIR = "label_output"
 
 DISTANCE_THRESHOLD = 1.0
@@ -56,14 +103,14 @@ VIEW_PADDING = 30
 
 # Label options after saving (press 1-5 to select)
 LABEL_OPTIONS = {
-    "1": "Expressway",
-    "2": "Nat/Prov Road",
-    "3": "HS Railway",
-    "4": "Conv Railway",
+    "1": "GSD",
+    "2": "GG",
+    "3": "TS",
+    "4": "TG",
     "5": "Other",
 }
 
-# ========================== Key Bindings ==========================
+# ========================== Quad Key Bindings ==========================
 KEY_MAP = {
     "right": ("move", 0),
     "up":    ("move", 1),
@@ -77,7 +124,20 @@ KEY_MAP = {
     "ctrl+z":    ("undo", None),
     "r":         ("reset", None),
     "enter":     ("save", None),
-    # label keys: handled separately in on_key during label-selection mode
+}
+
+# ========================== Hex Key Bindings ==========================
+HEX_KEY_MAP = {
+    "d": ("move", 1),  "right": ("move", 1),      # 右上
+    "e": ("move", 0),                              # 右下
+    "w": ("move", 5),  "up":    ("move", 5),       # 下
+    "q": ("move", 4),                              # 左下
+    "a": ("move", 3),  "left":  ("move", 3),       # 左上
+    "s": ("move", 2),  "down":  ("move", 2),       # 上
+    "backspace": ("undo", None),
+    "ctrl+z":    ("undo", None),
+    "r":         ("reset", None),
+    "enter":     ("save", None),
 }
 
 # ========================== Data Loading ==========================
@@ -105,151 +165,162 @@ def build_multi_mapdata(raw_mapdata, selected_mode):
     return np.clip(multi, 0, 1)
 
 
+# ========================== Hex Data Loading ==========================
+
+def load_hex_mapdata(path=HEX_PKL_PATH):
+    """加载六边形网格 pkl，触发原点初始化"""
+    _init_hex_origin(path)
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def load_traj_csv_hex(path):
+    """读取六边形模式轨迹 CSV，按 uid 分组生成起终点记录。
+
+    支持两种格式:
+    1. 起终点格式: x_o,y_o,z_o,x_d,y_d,z_d,mode,order
+    2. 点序列格式: uid,hex_x,hex_y,hex_z,...  → 按 uid 分组，每7行采样生成段
+    """
+    df = pd.read_csv(path)
+    # 检测格式: 有 hex_x/hex_y/hex_z 列 → 点序列格式
+    if "hex_x" in df.columns and "uid" in df.columns:
+        records = []
+        for uid, group in df.groupby("uid", sort=False):
+            group = group.reset_index(drop=True)
+            # 每7行采样，生成连续段
+            sampled_indices = list(range(0, len(group), 7))
+            for i in range(len(sampled_indices) - 1):
+                a = group.iloc[sampled_indices[i]]
+                b = group.iloc[sampled_indices[i + 1]]
+                # 跳过起终点相同的零距离段
+                if (int(a["hex_x"]) == int(b["hex_x"]) and
+                    int(a["hex_y"]) == int(b["hex_y"]) and
+                    int(a["hex_z"]) == int(b["hex_z"])):
+                    continue
+                records.append({
+                    "x_o": int(a["hex_x"]), "y_o": int(a["hex_y"]), "z_o": int(a["hex_z"]),
+                    "x_d": int(b["hex_x"]), "y_d": int(b["hex_y"]), "z_d": int(b["hex_z"]),
+                    "mode": str(a["attribution"]) if "attribution" in df.columns else "ALL",
+                    "order": int(uid),
+                })
+        return pd.DataFrame(records)
+    return df
+
+
 # ========================== State ==========================
 
 class LabelState:
-    """Holds labeling state for a single trajectory."""
+    """Holds labeling state for a single trajectory (quad or hex)."""
 
-    def __init__(self, row, multi_mapdata):
+    def __init__(self, row, multi_mapdata, is_hex=False, hex_grid=None):
         self.row = row
         self.order = int(row["order"]) if "order" in row.index else 0
         self.mode = str(row["mode"]).strip()
-        self.start_x = float(row["locx_o"])
-        self.start_y = float(row["locy_o"])
-        self.end_x = float(row["locx_d"])
-        self.end_y = float(row["locy_d"])
+        self.is_hex = is_hex
+        self.hex_grid = hex_grid
+
+        if is_hex:
+            self.start = (int(row["x_o"]), int(row["y_o"]), int(row["z_o"]))
+            self.end = (int(row["x_d"]), int(row["y_d"]), int(row["z_d"]))
+        else:
+            self.start_x = float(row["locx_o"])
+            self.start_y = float(row["locy_o"])
+            self.end_x = float(row["locx_d"])
+            self.end_y = float(row["locy_d"])
 
         self.multi_mapdata = multi_mapdata
 
-        self.cur_x = int(round(self.start_x))
-        self.cur_y = int(round(self.start_y))
-
-        self.path_history = [(self.cur_x, self.cur_y)]
+        if is_hex:
+            self.cur = self.start
+            self.path_history = [self.cur]
+        else:
+            self.cur_x = int(round(self.start_x))
+            self.cur_y = int(round(self.start_y))
+            self.path_history = [(self.cur_x, self.cur_y)]
         self.step_count = 0
 
     @property
     def reached(self):
+        if self.is_hex:
+            return hex_distance(self.cur, self.end) <= DISTANCE_THRESHOLD
         dist = abs(self.cur_x - self.end_x) + abs(self.cur_y - self.end_y)
         return dist <= DISTANCE_THRESHOLD
 
     @property
     def remaining_dist(self):
+        if self.is_hex:
+            return hex_distance(self.cur, self.end)
         return abs(self.cur_x - self.end_x) + abs(self.cur_y - self.end_y)
 
     def current_match_rate(self):
         if len(self.path_history) <= 1:
             return 0.0
+        if self.is_hex:
+            return calculate_match_rate_hex(self.path_history, self.multi_mapdata)
         return calculate_match_rate(self.path_history, self.multi_mapdata)
 
-    def can_move(self, dx, dy):
+    def can_move(self, *args):
+        if self.is_hex:
+            dx, dy, dz = args
+            nx, ny, nz = self.cur[0] + dx, self.cur[1] + dy, self.cur[2] + dz
+            return hex_in_map(nx, ny, nz, self.hex_grid)
+        dx, dy = args
         nx = self.cur_x + dx
         ny = self.cur_y + dy
         return 0 <= nx < MAP_COLS and 0 <= ny < MAP_ROWS
 
     def apply_move(self, action_id):
-        dx, dy = DX_DY[action_id]
-        self.cur_x += dx
-        self.cur_y += dy
-        self.path_history.append((self.cur_x, self.cur_y))
+        if self.is_hex:
+            dx, dy, dz = HEX_DIRS[action_id]
+            self.cur = (self.cur[0] + dx, self.cur[1] + dy, self.cur[2] + dz)
+            self.path_history.append(self.cur)
+        else:
+            dx, dy = DX_DY[action_id]
+            self.cur_x += dx
+            self.cur_y += dy
+            self.path_history.append((self.cur_x, self.cur_y))
         self.step_count += 1
 
     def undo(self):
         if len(self.path_history) > 1:
             self.path_history.pop()
-            self.cur_x, self.cur_y = self.path_history[-1]
+            if self.is_hex:
+                self.cur = self.path_history[-1]
+            else:
+                self.cur_x, self.cur_y = self.path_history[-1]
             self.step_count = max(0, self.step_count - 1)
             return True
         return False
 
     def reset(self):
-        self.cur_x = int(round(self.start_x))
-        self.cur_y = int(round(self.start_y))
-        self.path_history = [(self.cur_x, self.cur_y)]
+        if self.is_hex:
+            self.cur = self.start
+            self.path_history = [self.cur]
+        else:
+            self.cur_x = int(round(self.start_x))
+            self.cur_y = int(round(self.start_y))
+            self.path_history = [(self.cur_x, self.cur_y)]
         self.step_count = 0
 
 
 # ========================== Renderer ==========================
 
 class PathRenderer:
-    """Manages the matplotlib figure and incremental updates."""
+    """Manages the matplotlib figure and incremental updates (quad or hex)."""
 
-    def __init__(self, state: LabelState, raw_mapdata: dict):
+    def __init__(self, state: LabelState, raw_mapdata, road_sets=None):
         self.state = state
+        self.is_hex = state.is_hex
+        self.road_sets = road_sets
 
         self.fig, self.ax = plt.subplots(figsize=(12, 9))
-        self.fig.canvas.manager.set_window_title("LabelPath — Interactive Path Labeling")
+        title = "LabelPath — Hex Grid" if self.is_hex else "LabelPath — Interactive Path Labeling"
+        self.fig.canvas.manager.set_window_title(title)
 
-        # ---- 计算视口范围（网格坐标）----
-        x_vals = [state.start_x, state.end_x]
-        y_vals = [state.start_y, state.end_y]
-        x_center = (min(x_vals) + max(x_vals)) / 2
-        y_center = (min(y_vals) + max(y_vals)) / 2
-        x_range = max(abs(max(x_vals) - min(x_vals)), 20)
-        y_range = max(abs(max(y_vals) - min(y_vals)), 20)
-
-        grid_xmin = max(0, x_center - x_range / 2 - VIEW_PADDING)
-        grid_xmax = min(MAP_COLS, x_center + x_range / 2 + VIEW_PADDING)
-        grid_ymin = max(0, y_center - y_range / 2 - VIEW_PADDING)
-        grid_ymax = min(MAP_ROWS, y_center + y_range / 2 + VIEW_PADDING)
-
-        # ---- 转换视口边界到 Mercator 并设置底图 ----
-        mx_min, mx_max, my_min, my_max = grid_bounds_to_mercator(
-            grid_xmin, grid_xmax, grid_ymin, grid_ymax
-        )
-        self.ax.set_xlim(mx_min, mx_max)
-        self.ax.set_ylim(my_min, my_max)
-        self.ax.set_aspect("equal")
-
-        if USE_OSM_BASEMAP:
-            try:
-                add_osm_basemap(self.ax, alpha=0.8)
-            except Exception as e:
-                print(f"  [WARN] OSM basemap load failed: {e}")
-                print(f"  [WARN] Falling back to road-network overlay only")
-
-        # ---- 道路网络彩色叠加层（Mercator 坐标系）----
-        road_rgb = self._build_road_rgb(raw_mapdata)  # shape (529, 564, 3)
-        full_mx_min, full_mx_max, full_my_min, full_my_max = full_grid_bounds_mercator()
-        self.ax.imshow(
-            road_rgb,
-            extent=[full_mx_min, full_mx_max, full_my_min, full_my_max],
-            origin="lower",
-            alpha=0.45,
-            zorder=2,
-        )
-
-        # ---- 起终点标记（Mercator 坐标）----
-        start_mx, start_my = grid_to_mercator(state.start_x, state.start_y)
-        end_mx, end_my = grid_to_mercator(state.end_x, state.end_y)
-
-        self.start_handle = self.ax.scatter(
-            start_mx, start_my,
-            c="limegreen", marker="o", s=180,
-            edgecolors="darkgreen", linewidths=2,
-            zorder=5, label="Start",
-        )
-        self.end_handle = self.ax.scatter(
-            end_mx, end_my,
-            c="red", marker="X", s=180,
-            edgecolors="darkred", linewidths=2,
-            zorder=5, label="End",
-        )
-
-        # ---- 路径轨迹（初始为空）----
-        (self.path_line,) = self.ax.plot(
-            [], [], "-",
-            color="crimson", linewidth=2.5, alpha=0.85,
-            zorder=3, label="Path",
-        )
-
-        # ---- 光标（Mercator 坐标）----
-        cursor_mx, cursor_my = grid_to_mercator(state.cur_x, state.cur_y)
-        self.cursor = self.ax.scatter(
-            cursor_mx, cursor_my,
-            c="cyan", marker="o", s=25,
-            edgecolors="darkblue", linewidths=1.5,
-            zorder=6, label="Cursor",
-        )
+        if self.is_hex:
+            self._init_hex_view(state, raw_mapdata)
+        else:
+            self._init_quad_view(state, raw_mapdata)
 
         self.ax.set_xlabel("Web Mercator X (EPSG:3857)")
         self.ax.set_ylabel("Web Mercator Y (EPSG:3857)")
@@ -267,8 +338,181 @@ class PathRenderer:
 
         self._update_title()
         self._draw_legend_box()
-
         self.fig.tight_layout()
+
+    # ======================== Quad View Init ========================
+
+    def _init_quad_view(self, state, raw_mapdata):
+        x_vals = [state.start_x, state.end_x]
+        y_vals = [state.start_y, state.end_y]
+        x_center = (min(x_vals) + max(x_vals)) / 2
+        y_center = (min(y_vals) + max(y_vals)) / 2
+        x_range = max(abs(max(x_vals) - min(x_vals)), 20)
+        y_range = max(abs(max(y_vals) - min(y_vals)), 20)
+
+        grid_xmin = max(0, x_center - x_range / 2 - VIEW_PADDING)
+        grid_xmax = min(MAP_COLS, x_center + x_range / 2 + VIEW_PADDING)
+        grid_ymin = max(0, y_center - y_range / 2 - VIEW_PADDING)
+        grid_ymax = min(MAP_ROWS, y_center + y_range / 2 + VIEW_PADDING)
+
+        mx_min, mx_max, my_min, my_max = grid_bounds_to_mercator(
+            grid_xmin, grid_xmax, grid_ymin, grid_ymax
+        )
+        self.ax.set_xlim(mx_min, mx_max)
+        self.ax.set_ylim(my_min, my_max)
+        self.ax.set_aspect("equal")
+
+        if USE_OSM_BASEMAP:
+            try:
+                add_osm_basemap(self.ax, alpha=0.8)
+            except Exception as e:
+                print(f"  [WARN] OSM basemap load failed: {e}")
+
+        road_rgb = self._build_road_rgb(raw_mapdata)
+        full_mx_min, full_mx_max, full_my_min, full_my_max = full_grid_bounds_mercator()
+        self.ax.imshow(
+            road_rgb,
+            extent=[full_mx_min, full_mx_max, full_my_min, full_my_max],
+            origin="lower",
+            alpha=0.45,
+            zorder=2,
+        )
+
+        start_mx, start_my = grid_to_mercator(state.start_x, state.start_y)
+        end_mx, end_my = grid_to_mercator(state.end_x, state.end_y)
+
+        self.start_handle = self.ax.scatter(
+            start_mx, start_my,
+            c="limegreen", marker="o", s=180,
+            edgecolors="darkgreen", linewidths=2, zorder=5, label="Start",
+        )
+        self.end_handle = self.ax.scatter(
+            end_mx, end_my,
+            c="red", marker="X", s=180,
+            edgecolors="darkred", linewidths=2, zorder=5, label="End",
+        )
+
+        (self.path_line,) = self.ax.plot(
+            [], [], "-",
+            color="crimson", linewidth=2.5, alpha=0.85, zorder=3, label="Path",
+        )
+
+        cursor_mx, cursor_my = grid_to_mercator(state.cur_x, state.cur_y)
+        self.cursor = self.ax.scatter(
+            cursor_mx, cursor_my,
+            c="cyan", marker="o", s=25,
+            edgecolors="darkblue", linewidths=1.5, zorder=6, label="Cursor",
+        )
+
+    # ======================== Hex View Init ========================
+
+    def _init_hex_view(self, state, raw_mapdata):
+        # 从起止点 WGS84 坐标计算视口（Mercator）
+        start_lon, start_lat = hex_to_wgs84(*state.start)
+        end_lon, end_lat = hex_to_wgs84(*state.end)
+
+        from utils.geo_utils import _wgs84_to_merc
+        start_mx, start_my = _wgs84_to_merc.transform(start_lon, start_lat)
+        end_mx, end_my = _wgs84_to_merc.transform(end_lon, end_lat)
+
+        x_center = (start_mx + end_mx) / 2
+        y_center = (start_my + end_my) / 2
+        x_range = max(abs(end_mx - start_mx), 12000)
+        y_range = max(abs(end_my - start_my), 12000)
+
+        pad = VIEW_PADDING_METERS
+        self._mx_min = x_center - x_range / 2 - pad
+        self._mx_max = x_center + x_range / 2 + pad
+        self._my_min = y_center - y_range / 2 - pad
+        self._my_max = y_center + y_range / 2 + pad
+
+        self.ax.set_xlim(self._mx_min, self._mx_max)
+        self.ax.set_ylim(self._my_min, self._my_max)
+        self.ax.set_aspect("equal")
+
+        if USE_OSM_BASEMAP:
+            try:
+                add_osm_basemap(self.ax, alpha=0.8)
+            except Exception as e:
+                print(f"  [WARN] OSM basemap load failed: {e}")
+
+        # 道路叠加层：每个模式用散点图
+        if self.road_sets is not None:
+            self._build_hex_road_overlay(raw_mapdata)
+
+        # 起终点标记
+        self.start_handle = self.ax.scatter(
+            start_mx, start_my,
+            c="limegreen", marker="o", s=180,
+            edgecolors="darkgreen", linewidths=2, zorder=5, label="Start",
+        )
+        self.end_handle = self.ax.scatter(
+            end_mx, end_my,
+            c="red", marker="X", s=180,
+            edgecolors="darkred", linewidths=2, zorder=5, label="End",
+        )
+
+        (self.path_line,) = self.ax.plot(
+            [], [], "-",
+            color="crimson", linewidth=2.5, alpha=0.85, zorder=3, label="Path",
+        )
+
+        cursor_mx, cursor_my = hex_to_mercator(*state.cur)
+        self.cursor = self.ax.scatter(
+            cursor_mx, cursor_my,
+            c="cyan", marker="o", s=25,
+            edgecolors="darkblue", linewidths=1.5, zorder=6, label="Cursor",
+        )
+
+    def _build_hex_road_overlay(self, hex_grid):
+        """六边形模式道路叠加层 —— 视口范围内的散点图"""
+        mode_rgb = {
+            "TG":  (0.65, 0.00, 0.65),
+            "GG":  (0.00, 0.45, 1.00),
+            "GSD": (0.00, 0.75, 0.00),
+            "TS":  (1.00, 0.00, 0.00),
+        }
+
+        # 视口 Mercator 四角 → WGS84 → 近似 hex 坐标范围
+        from utils.geo_utils import _merc_to_wgs84
+        corners_mx = [self._mx_min, self._mx_max, self._mx_max, self._mx_min]
+        corners_my = [self._my_min, self._my_min, self._my_max, self._my_max]
+        corners_lon, corners_lat = _merc_to_wgs84.transform(corners_mx, corners_my)
+        hex_xs, hex_ys, hex_zs = wgs84_to_hex(corners_lon, corners_lat)
+
+        margin = 3
+        x_lo, x_hi = int(np.min(hex_xs)) - margin, int(np.max(hex_xs)) + margin
+        y_lo, y_hi = int(np.min(hex_ys)) - margin, int(np.max(hex_ys)) + margin
+        z_lo, z_hi = int(np.min(hex_zs)) - margin, int(np.max(hex_zs)) + margin
+
+        for mode_name in MODE_LIST:
+            if mode_name not in self.road_sets:
+                continue
+            road_set = self.road_sets[mode_name]
+            # 收集视口范围内的道路 hex
+            mx_list, my_list = [], []
+            for x in range(x_lo, x_hi + 1):
+                for y in range(y_lo, y_hi + 1):
+                    z = -x - y
+                    if not (z_lo <= z <= z_hi):
+                        continue
+                    if (x, y, z) not in road_set:
+                        continue
+                    if (x, y, z) not in hex_grid:
+                        continue
+                    # 检查是否在 Mercator 视口内
+                    mx, my = hex_to_mercator(x, y, z)
+                    if self._mx_min <= mx <= self._mx_max and self._my_min <= my <= self._my_max:
+                        mx_list.append(mx)
+                        my_list.append(my)
+
+            if mx_list:
+                r, g, b = mode_rgb.get(mode_name, (0.5, 0.5, 0.5))
+                self.ax.scatter(
+                    mx_list, my_list,
+                    c=[(r, g, b)], s=4, alpha=0.4,
+                    marker='h', zorder=2, label=mode_name,
+                )
 
     def _build_road_rgb(self, raw_mapdata, resolution=500):
         """Build an RGB image resampled to a regular Mercator (EPSG:3857) grid.
@@ -350,20 +594,29 @@ class PathRenderer:
     def show_label_prompt(self):
         """Show the label selection prompt after Enter is pressed."""
         self.ax.set_title(
-            "SELECT LABEL:  [1] Expressway  [2] Nat/Prov  [3] HS-Rail  [4] Conv-Rail  [5] Other",
+            "SELECT LABEL:  [1] GSD  [2] GG  [3] TS  [4] TG  [5] Other",
             fontsize=12, fontfamily="monospace", color="darkblue",
         )
         self.fig.canvas.draw_idle()
 
     def refresh(self):
-        """Incremental update: path line + cursor position (Mercator)."""
+        """Incremental update: path line + cursor position."""
         state = self.state
-        xs = [p[0] for p in state.path_history]
-        ys = [p[1] for p in state.path_history]
-        merc_x, merc_y = grid_to_mercator(xs, ys)
+        if self.is_hex:
+            xs = [p[0] for p in state.path_history]
+            ys = [p[1] for p in state.path_history]
+            zs = [p[2] for p in state.path_history]
+            merc_x, merc_y = hex_to_mercator(xs, ys, zs)
+        else:
+            xs = [p[0] for p in state.path_history]
+            ys = [p[1] for p in state.path_history]
+            merc_x, merc_y = grid_to_mercator(xs, ys)
         self.path_line.set_data(merc_x, merc_y)
 
-        cursor_mx, cursor_my = grid_to_mercator(state.cur_x, state.cur_y)
+        if self.is_hex:
+            cursor_mx, cursor_my = hex_to_mercator(*state.cur)
+        else:
+            cursor_mx, cursor_my = grid_to_mercator(state.cur_x, state.cur_y)
         self.cursor.set_offsets([[cursor_mx, cursor_my]])
         self._update_title()
         self.fig.canvas.draw_idle()
@@ -390,7 +643,7 @@ class LabelController:
         if start_in_label_mode:
             self.selecting_label = True
             self.renderer.show_label_prompt()
-            print(f"  Select label: 1=Expressway 2=Nat/Prov 3=HS-Rail 4=Conv-Rail 5=Other")
+            print(f"  Select label: 1=GSD 2=GG 3=TS 4=TG 5=Other")
             print(f"  (Backspace to re-edit path)")
 
     def on_key(self, event):
@@ -424,16 +677,22 @@ class LabelController:
                 print(f"  Label selection cancelled, back to path editing")
             return
 
-        if key not in KEY_MAP:
+        keymap = HEX_KEY_MAP if self.state.is_hex else KEY_MAP
+        if key not in keymap:
             return
 
-        action, arg = KEY_MAP[key]
+        action, arg = keymap[key]
 
         if action == "move":
-            dx, dy = DX_DY[arg]
-            if self.state.can_move(dx, dy):
-                self.state.apply_move(arg)
-                self.renderer.refresh()
+            if self.state.is_hex:
+                if self.state.can_move(*HEX_DIRS[arg]):
+                    self.state.apply_move(arg)
+                    self.renderer.refresh()
+            else:
+                dx, dy = DX_DY[arg]
+                if self.state.can_move(dx, dy):
+                    self.state.apply_move(arg)
+                    self.renderer.refresh()
 
         elif action == "undo":
             if len(self.state.path_history) <= 1:
@@ -454,7 +713,7 @@ class LabelController:
         elif action == "save":
             self.selecting_label = True
             self.renderer.show_label_prompt()
-            print(f"  Select label: 1=Expressway 2=Nat/Prov 3=HS-Rail 4=Conv-Rail 5=Other")
+            print(f"  Select label: 1=GSD 2=GG 3=TS 4=TG 5=Other")
             print(f"  (Backspace to cancel)")
 
     def _finalize(self, label):
@@ -464,8 +723,11 @@ class LabelController:
 
         csv_path = os.path.join(self.output_dir, "traj_labeled.csv")
 
-        traj_list = [[float(p[0]), float(p[1])] for p in state.path_history]
-        match_rate = calculate_match_rate(state.path_history, state.multi_mapdata)
+        if state.is_hex:
+            traj_list = [[int(p[0]), int(p[1]), int(p[2])] for p in state.path_history]
+        else:
+            traj_list = [[float(p[0]), float(p[1])] for p in state.path_history]
+        match_rate = state.current_match_rate()
 
         record = {
             "episode": self.current_idx,
@@ -495,9 +757,9 @@ class LabelController:
 # ========================== Main Loop ==========================
 
 def run_single(state, raw_mapdata, output_dir, batch_mode, idx,
-               start_in_label_mode=False):
+               start_in_label_mode=False, road_sets=None):
     """Run labeling for one trajectory. Returns (next_idx, keep_going)."""
-    renderer = PathRenderer(state, raw_mapdata)
+    renderer = PathRenderer(state, raw_mapdata, road_sets=road_sets)
     controller = LabelController(
         state, renderer, output_dir, batch_mode, idx,
         start_in_label_mode=start_in_label_mode,
@@ -514,8 +776,12 @@ def run_single(state, raw_mapdata, output_dir, batch_mode, idx,
     if not start_in_label_mode:
         print(f"\n{'='*60}")
         print(f"#{idx}  order={state.order}  mode={state.mode}")
-        print(f"Start: ({state.start_x}, {state.start_y})  ->  End: ({state.end_x}, {state.end_y})")
-        print(f"Keys: Arrows/WASD=move  Backspace=undo  R=reset  Enter=save & label")
+        if state.is_hex:
+            print(f"Start: {state.start}  ->  End: {state.end}")
+            print(f"Keys: W/A/S/D/Q/E=move  Backspace=undo  R=reset  Enter=save & label")
+        else:
+            print(f"Start: ({state.start_x}, {state.start_y})  ->  End: ({state.end_x}, {state.end_y})")
+            print(f"Keys: Arrows/WASD=move  Backspace=undo  R=reset  Enter=save & label")
         print(f"{'='*60}")
     else:
         print(f"\n#{idx}  order={state.order}  mode={state.mode}  [RE-LABEL]")
@@ -542,13 +808,50 @@ def main():
                         help="path to trajectory CSV")
     parser.add_argument("--mapdata", type=str, default=DEFAULT_MAPDATA_PATH,
                         help="path to map pickle file")
+    parser.add_argument("--grid", type=str, default="hex",
+                        choices=["quad", "hex"],
+                        help="grid type: quad (1000m quadrilateral) or hex (200m hexagon)")
     args = parser.parse_args()
 
-    print("Loading map data...")
-    raw_mapdata = load_mapdata(args.mapdata)
-    print("Loading trajectory data...")
-    traj_df = load_traj_csv(args.csv)
-    print(f"Total trajectories: {len(traj_df)}")
+    is_hex = (args.grid == "hex")
+
+    if is_hex:
+        # ---- 六边形模式 ----
+        if args.mapdata == DEFAULT_MAPDATA_PATH:
+            args.mapdata = HEX_PKL_PATH
+        print("Loading hex grid map data...")
+        raw_mapdata = load_hex_mapdata(args.mapdata)
+        print(f"  Hex cells: {len(raw_mapdata):,}")
+        print("Building road sets...")
+        road_sets = hex_mapdata_to_road_sets(raw_mapdata)
+        for m in MODE_LIST:
+            print(f"  {m}: {len(road_sets[m]):,} cells")
+        print("Loading trajectory data...")
+        traj_df = load_traj_csv_hex(args.csv)
+        print(f"Total trajectories: {len(traj_df)}")
+
+        def make_state(row):
+            mode = str(row["mode"]).strip()
+            if mode not in MODE_LIST:
+                mode = "ALL"
+            if mode == "ALL":
+                multi = set().union(*road_sets.values())
+            else:
+                multi = build_multi_mapdata_hex(road_sets, mode)
+            return LabelState(row, multi, is_hex=True, hex_grid=raw_mapdata)
+    else:
+        # ---- 四边形模式（原有逻辑）----
+        print("Loading map data...")
+        raw_mapdata = load_mapdata(args.mapdata)
+        print("Loading trajectory data...")
+        traj_df = load_traj_csv(args.csv)
+        print(f"Total trajectories: {len(traj_df)}")
+        road_sets = None
+
+        def make_state(row):
+            mode = str(row["mode"]).strip()
+            multi = build_multi_mapdata(raw_mapdata, mode)
+            return LabelState(row, multi)
 
     output_dir = args.output
 
@@ -556,35 +859,28 @@ def main():
         if args.index < 0 or args.index >= len(traj_df):
             print(f"Error: index out of range [0, {len(traj_df)-1}]")
             sys.exit(1)
-        row = traj_df.iloc[args.index]
-        mode = str(row["mode"]).strip()
-        multi = build_multi_mapdata(raw_mapdata, mode)
-        state = LabelState(row, multi)
-        run_single(state, raw_mapdata, output_dir, batch_mode=False, idx=args.index)
+        state = make_state(traj_df.iloc[args.index])
+        run_single(state, raw_mapdata, output_dir, batch_mode=False,
+                   idx=args.index, road_sets=road_sets)
 
     elif args.batch:
         idx = 0
         while idx < len(traj_df):
-            row = traj_df.iloc[idx]
-            mode = str(row["mode"]).strip()
-            multi = build_multi_mapdata(raw_mapdata, mode)
-            state = LabelState(row, multi)
+            state = make_state(traj_df.iloc[idx])
             next_idx, keep_going = run_single(
-                state, raw_mapdata, output_dir, batch_mode=True, idx=idx,
+                state, raw_mapdata, output_dir, batch_mode=True,
+                idx=idx, road_sets=road_sets,
             )
             if not keep_going:
                 print(f"Labeling stopped, completed up to #{idx}")
                 break
-            # If go_back: next_idx < current idx, enter label mode on previous
             start_label = (next_idx < idx)
             idx = next_idx
             if start_label:
-                row = traj_df.iloc[idx]
-                mode = str(row["mode"]).strip()
-                multi = build_multi_mapdata(raw_mapdata, mode)
-                state = LabelState(row, multi)
+                state = make_state(traj_df.iloc[idx])
                 next_idx, keep_going = run_single(
-                    state, raw_mapdata, output_dir, batch_mode=True, idx=idx,
+                    state, raw_mapdata, output_dir, batch_mode=True,
+                    idx=idx, road_sets=road_sets,
                     start_in_label_mode=True,
                 )
                 if not keep_going:
@@ -615,12 +911,10 @@ def main():
 
         idx = start_idx
         while idx < len(traj_df):
-            row = traj_df.iloc[idx]
-            mode = str(row["mode"]).strip()
-            multi = build_multi_mapdata(raw_mapdata, mode)
-            state = LabelState(row, multi)
+            state = make_state(traj_df.iloc[idx])
             next_idx, keep_going = run_single(
-                state, raw_mapdata, output_dir, batch_mode=True, idx=idx,
+                state, raw_mapdata, output_dir, batch_mode=True,
+                idx=idx, road_sets=road_sets,
             )
             if not keep_going:
                 print(f"Labeling stopped, completed up to #{idx}")
@@ -628,12 +922,10 @@ def main():
             start_label = (next_idx < idx)
             idx = next_idx
             if start_label:
-                row = traj_df.iloc[idx]
-                mode = str(row["mode"]).strip()
-                multi = build_multi_mapdata(raw_mapdata, mode)
-                state = LabelState(row, multi)
+                state = make_state(traj_df.iloc[idx])
                 next_idx, keep_going = run_single(
-                    state, raw_mapdata, output_dir, batch_mode=True, idx=idx,
+                    state, raw_mapdata, output_dir, batch_mode=True,
+                    idx=idx, road_sets=road_sets,
                     start_in_label_mode=True,
                 )
                 if not keep_going:
