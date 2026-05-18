@@ -174,6 +174,14 @@ def load_hex_mapdata(path=HEX_PKL_PATH):
         return pickle.load(f)
 
 
+# 原始点级数据缓存，供速度分布图使用
+_RAW_POINT_DF = None
+
+
+def get_raw_point_df():
+    return _RAW_POINT_DF
+
+
 def load_traj_csv_hex(path):
     """读取六边形模式轨迹 CSV，按 uid 分组生成起终点记录。
 
@@ -181,9 +189,11 @@ def load_traj_csv_hex(path):
     1. 起终点格式: x_o,y_o,z_o,x_d,y_d,z_d,mode,order
     2. 点序列格式: uid,hex_x,hex_y,hex_z,...  → 按 uid 分组，每7行采样生成段
     """
+    global _RAW_POINT_DF
     df = pd.read_csv(path)
     # 检测格式: 有 hex_x/hex_y/hex_z 列 → 点序列格式
     if "hex_x" in df.columns and "uid" in df.columns:
+        _RAW_POINT_DF = df  # 缓存原始数据
         records = []
         for uid, group in df.groupby("uid", sort=False):
             group = group.reset_index(drop=True)
@@ -202,6 +212,7 @@ def load_traj_csv_hex(path):
                     "x_d": int(b["hex_x"]), "y_d": int(b["hex_y"]), "z_d": int(b["hex_z"]),
                     "mode": str(a["attribution"]) if "attribution" in df.columns else "ALL",
                     "order": int(uid),
+                    "uid": int(uid),
                 })
         return pd.DataFrame(records)
     return df
@@ -216,6 +227,7 @@ class LabelState:
         self.row = row
         self.order = int(row["order"]) if "order" in row.index else 0
         self.mode = str(row["mode"]).strip()
+        self.uid = int(row["uid"]) if "uid" in row.index else self.order
         self.is_hex = is_hex
         self.hex_grid = hex_grid
 
@@ -313,8 +325,17 @@ class PathRenderer:
         self.is_hex = state.is_hex
         self.road_sets = road_sets
 
-        self.fig, self.ax = plt.subplots(figsize=(12, 9))
-        title = "LabelPath — Hex Grid" if self.is_hex else "LabelPath — Interactive Path Labeling"
+        if self.is_hex:
+            # 左右分栏：左侧地图，右侧速度分布
+            self.fig = plt.figure(figsize=(16, 9))
+            gs = self.fig.add_gridspec(1, 2, width_ratios=[3, 1], wspace=0.02)
+            self.ax = self.fig.add_subplot(gs[0])
+            self.ax_hist = self.fig.add_subplot(gs[1])
+            title = "LabelPath — Hex Grid"
+        else:
+            self.fig, self.ax = plt.subplots(figsize=(12, 9))
+            self.ax_hist = None
+            title = "LabelPath — Interactive Path Labeling"
         self.fig.canvas.manager.set_window_title(title)
 
         if self.is_hex:
@@ -464,6 +485,33 @@ class PathRenderer:
             edgecolors="darkblue", linewidths=1.5, zorder=6, label="Cursor",
         )
 
+        # ---- 右侧：速度分布直方图 ----
+        self._draw_velocity_hist(state)
+
+    def _draw_velocity_hist(self, state):
+        """在右侧子图绘制当前 uid 的速度分布直方图"""
+        raw = get_raw_point_df()
+        if raw is None or self.ax_hist is None:
+            return
+        uid_data = raw[raw["uid"] == state.uid]
+        velocities = uid_data["velocity"].dropna()
+        velocities = velocities[velocities >= 0]
+
+        self.ax_hist.clear()
+        if len(velocities) > 0:
+            self.ax_hist.hist(velocities, bins=25, color="steelblue",
+                              edgecolor="white", alpha=0.85)
+            self.ax_hist.axvline(velocities.median(), color="red", ls="--", lw=1.2,
+                                 label=f'median={velocities.median():.1f}')
+            mean_v = velocities.mean()
+            self.ax_hist.axvline(mean_v, color="orange", ls="--", lw=1.2,
+                                 label=f'mean={mean_v:.1f}')
+            self.ax_hist.legend(fontsize=7, loc="upper right")
+        self.ax_hist.set_xlabel("Velocity", fontsize=9)
+        self.ax_hist.set_ylabel("Count", fontsize=9)
+        self.ax_hist.set_title(f"UID {state.uid}\nn={len(velocities)}", fontsize=10)
+        self.ax_hist.tick_params(labelsize=8)
+
     def _build_hex_road_overlay(self, hex_grid):
         """六边形模式道路叠加层 —— 视口范围内的散点图"""
         mode_rgb = {
@@ -510,7 +558,7 @@ class PathRenderer:
                 r, g, b = mode_rgb.get(mode_name, (0.5, 0.5, 0.5))
                 self.ax.scatter(
                     mx_list, my_list,
-                    c=[(r, g, b)], s=4, alpha=0.4,
+                    c=[(r, g, b)], s=6, alpha=0.55,
                     marker='h', zorder=2, label=mode_name,
                 )
 

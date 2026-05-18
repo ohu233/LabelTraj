@@ -20,17 +20,37 @@ OSM_PROVIDER = xyzservices.TileProvider(
     name="OpenStreetMap.Mapnik",
 )
 
+# 备用 tile 源（CartoDB，在国内通常比 OSM 快）
+FALLBACK_PROVIDER = xyzservices.TileProvider(
+    url="https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
+    max_zoom=19,
+    min_zoom=0,
+    attribution="(C) CartoDB",
+    name="CartoDB.Positron",
+)
+
 
 def add_osm_basemap(ax, alpha=1.0, zoom=None):
-    """在给定 Axes 上叠加 OSM 道路瓦片底图。Axes 需已在 EPSG:3857 空间。"""
-    ctx.add_basemap(
-        ax,
-        crs="EPSG:3857",
-        source=OSM_PROVIDER,
-        zoom=zoom or "auto",
-        alpha=alpha,
-        reset_extent=False,
-    )
+    """在给定 Axes 上叠加 OSM 道路瓦片底图。
+    先尝试 OSM，失败则尝试 CartoDB 备用源。
+    """
+    providers = [OSM_PROVIDER, FALLBACK_PROVIDER]
+    last_err = None
+    for provider in providers:
+        try:
+            ctx.add_basemap(
+                ax,
+                crs="EPSG:3857",
+                source=provider,
+                zoom=zoom or "auto",
+                alpha=alpha,
+                reset_extent=False,
+            )
+            return  # 成功
+        except Exception as e:
+            last_err = e
+    # 全部失败时仅打印警告，不做额外处理
+    print(f"  [WARN] All tile providers failed: {last_err}")
 
 
 def set_ax_extent(ax, xmin, xmax, ymin, ymax):
