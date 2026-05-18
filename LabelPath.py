@@ -81,8 +81,8 @@ HEX_DIRS = {
     5: (0, -1, 1),   # SE / 东南/下
 }
 
-VIEW_PADDING_METERS = 6000  # hex 模式视口边距（Mercator 米）
-HEX_PKL_PATH = "map-processor/hex_grid.pkl"
+VIEW_PADDING_METERS = 10000  # hex 模式视口边距（Mercator 米）
+HEX_PKL_PATH = "data\hex_grid.pkl"
 
 # ========================== Shared Constants ==========================
 
@@ -95,7 +95,7 @@ MODE_COLORS = {
 MODE_LIST = ["GSD", "GG", "TS", "TG"]
 
 DEFAULT_MAPDATA_PATH = "data/GridModesAdjacentRealworld.pkl"
-DEFAULT_CSV_PATH = "data/dataset518_with_hex.csv"
+DEFAULT_CSV_PATH = "data\dataset_20230917_nanjing_to_gaochun_lishui_with_hex.csv"
 DEFAULT_OUTPUT_DIR = "label_output"
 
 DISTANCE_THRESHOLD = 1.0
@@ -198,7 +198,7 @@ def load_traj_csv_hex(path):
         for uid, group in df.groupby("uid", sort=False):
             group = group.reset_index(drop=True)
             # 每7行采样，生成连续段
-            sampled_indices = list(range(0, len(group), 7))
+            sampled_indices = list(range(0, len(group), 1))
             for i in range(len(sampled_indices) - 1):
                 a = group.iloc[sampled_indices[i]]
                 b = group.iloc[sampled_indices[i + 1]]
