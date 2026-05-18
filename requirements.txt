@@ -1,35 +1,51 @@
+affine==2.4.0
 asttokens==3.0.1
+attrs==26.1.0
 Bottleneck @ file:///C:/miniconda3/conda-bld/bottleneck_1761938072950/work
+branca @ file:///C:/Users/task_176709364982566/croot/branca_1767093784970/work
+brotlicffi @ file:///C:/miniconda3/conda-bld/brotlicffi_1764961399696/work
 certifi==2026.2.25
+cffi @ file:///C:/miniconda3/conda-bld/cffi_1761832792995/work
+charset-normalizer @ file:///C:/miniconda3/conda-bld/charset-normalizer_1761744960410/work
+click==8.4.0
+cligj==0.7.2
 cloudpickle==3.1.2
 colorama==0.4.6
 comm==0.2.3
-contourpy==1.3.3
-cycler==0.12.1
+contextily==1.7.0
+contourpy @ file:///C:/miniconda3/conda-bld/contourpy_1763643943275/work
+cycler @ file:///C:/Users/task_176606794786808/croot/cycler_1766068049869/work
 debugpy==1.8.20
 decorator==5.2.1
 et_xmlfile==2.0.0
 executing==2.2.1
 Farama-Notifications==0.0.4
 filelock==3.19.1
+folium @ file:///C:/miniconda3/conda-bld/folium_1758749962202/work
 fonttools==4.60.1
 fsspec==2025.9.0
+geographiclib==2.1
+geopandas @ file:///C:/Users/task_177444512033321/croot/geopandas-split_1774445944601/work
+geopy==2.4.1
 gym-notices==0.1.0
 gymnasium==1.2.2
+idna @ file:///C:/miniconda3/conda-bld/idna_1761912000545/work
 ipykernel==7.2.0
 ipython==9.11.0
 ipython_pygments_lexers==1.1.1
 jedi==0.19.2
 jieba==0.42.1
-Jinja2==3.1.6
+Jinja2 @ file:///C:/b/abs_920kup4e6u/croot/jinja2_1741711580669/work
 joblib==1.5.2
 jupyter_client==8.8.0
 jupyter_core==5.9.1
-kiwisolver==1.4.9
+kiwisolver @ file:///C:/miniconda3/conda-bld/kiwisolver_1764159385651/work
 lxml==6.1.0
+mapclassify @ file:///C:/Users/task_177082085138720/croot/mapclassify_1770821139675/work
 MarkupSafe==2.1.5
 matplotlib==3.10.7
 matplotlib-inline==0.2.1
+mercantile==1.2.1
 mkl-service==2.5.2
 mkl_fft @ file:///C:/miniconda3/conda-bld/mkl_fft_1761592917950/work
 mkl_random @ file:///C:/miniconda3/conda-bld/mkl_random_1761593166070/work
@@ -50,23 +66,29 @@ psutil==7.2.2
 pure_eval==0.2.3
 py4j @ file:///C:/miniconda3/conda-bld/py4j_1758132885001/work
 pyarrow @ file:///C:/Users/task_177557227935187/croot/pyarrow_1775572627705/work/python
+pycparser @ file:///C:/Users/task_177495970455161/croot/pycparser_1774959805958/work
 pygame==2.6.1
 Pygments==2.19.2
-pyparsing==3.2.5
-pyproj==3.7.2
+pyogrio @ file:///C:/b/abs_3ccy1t5qd8/croot/pyogrio_1753452344091/work
+pyparsing @ file:///C:/miniconda3/conda-bld/pyparsing_1763973902692/work
+pyproj @ file:///C:/b/abs_fdab5w83yy/croot/pyproj_1739284782126/work
+PySocks @ file:///C:/miniconda3/conda-bld/pysocks_1761753030940/work
 pyspark @ file:///C:/Users/task_177564080064639/croot/pyspark_1775641605062/work
 python-dateutil @ file:///C:/b/abs_3au_koqnbs/croot/python-dateutil_1716495777160/work
 python-docx==1.2.0
 pytz==2025.2
 pyzmq==27.1.0
+rasterio==1.5.0
+requests @ file:///C:/Users/task_177506612367653/croot/requests_1775066193776/work
 scikit-learn==1.7.2
 scipy==1.16.3
 seaborn==0.13.2
 setuptools==80.9.0
+shapely @ file:///C:/miniconda3/conda-bld/shapely_1764846929002/work
 six @ file:///C:/b/abs_149wuyuo1o/croot/six_1744271521515/work
 stack-data==0.6.3
 sympy==1.14.0
-threadpoolctl==3.6.0
+threadpoolctl @ file:///C:/miniconda3/conda-bld/threadpoolctl_1764361791480/work
 torch==2.9.0+cu130
 torchvision==0.24.0+cu130
 tornado==6.5.5
@@ -74,6 +96,9 @@ tqdm==4.67.1
 traitlets==5.14.3
 typing_extensions==4.15.0
 tzdata==2025.2
+urllib3 @ file:///C:/Users/task_177853580413500/croot/urllib3_1778536213663/work
 wcwidth==0.6.0
 wheel==0.45.1
+win_inet_pton @ file:///C:/miniconda3/conda-bld/win_inet_pton_1761746278813/work
 wordcloud==1.9.6
+xyzservices @ file:///C:/Users/task_177678304050681/croot/xyzservices_1776783114622/work
