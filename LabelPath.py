@@ -101,13 +101,14 @@ DEFAULT_OUTPUT_DIR = "label_output"
 DISTANCE_THRESHOLD = 1.0
 VIEW_PADDING = 30
 
-# Label options after saving (press 1-5 to select)
+# Label options after saving (press 1-6 to select)
 LABEL_OPTIONS = {
     "1": "GSD",
     "2": "GG",
     "3": "TS",
     "4": "TG",
-    "5": "Other",
+    "5": "Mixed",
+    "6": "Other",
 }
 
 # ========================== Quad Key Bindings ==========================
@@ -213,6 +214,13 @@ def load_traj_csv_hex(path):
                     "mode": str(a["attribution"]) if "attribution" in df.columns else "ALL",
                     "order": int(uid),
                     "uid": int(uid),
+                    "idx_o": int(a["idx"]) if "idx" in df.columns else int(a.name),
+                    "stime_o": int(a["stime"]) if "stime" in df.columns else 0,
+                    "lat_o": float(a["lat"]) if "lat" in df.columns else 0.0,
+                    "lon_o": float(a["lon"]) if "lon" in df.columns else 0.0,
+                    "time_d": float(b["time_value"]) if "time_value" in df.columns else 0.0,
+                    "dist_d": float(b["dist_value"]) if "dist_value" in df.columns else 0.0,
+                    "velocity_d": float(b["velocity"]) if "velocity" in df.columns else 0.0,
                 })
         return pd.DataFrame(records)
     return df
@@ -354,11 +362,14 @@ class PathRenderer:
             Line2D([0], [0], color="green", lw=3, label="GSD"),
             Line2D([0], [0], color="red", lw=3, label="TS"),
         ]
-        handles, labels = self.ax.get_legend_handles_labels()
-        self.ax.legend(handles=mode_handles + handles, loc="upper right")
+        self.ax.legend(
+            handles=mode_handles, loc="lower right",
+            fontsize=7, handlelength=1.5, borderpad=0.4, labelspacing=0.3,
+        )
 
         self._update_title()
         self._draw_legend_box()
+        self._draw_segment_info()
         self.fig.tight_layout()
 
     # ======================== Quad View Init ========================
@@ -493,7 +504,7 @@ class PathRenderer:
         raw = get_raw_point_df()
         if raw is None or self.ax_hist is None:
             return
-        uid_data = raw[raw["uid"] == state.uid]
+        uid_data = raw[(raw["uid"] == state.uid) & (raw["attribution"] != "origin")]
         velocities = uid_data["velocity"].dropna()
         velocities = velocities[velocities >= 0]
 
@@ -639,10 +650,43 @@ class PathRenderer:
             bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.9),
         )
 
+    def _draw_segment_info(self):
+        """六边形模式：在右上角显示当前段的 dist / time / velocity"""
+        state = self.state
+        if not state.is_hex:
+            return
+        row = state.row
+
+        def _fmt(val, fmt_spec):
+            try:
+                v = float(val)
+            except (ValueError, TypeError):
+                return "-"
+            return format(v, fmt_spec)
+
+        dist_str = _fmt(row.get("dist_d", ""), ".1f")
+        time_str = _fmt(row.get("time_d", ""), ".0f")
+
+        vel_str = _fmt(row.get("velocity_d", ""), ".2f")
+
+        text = (
+            "Segment Info:\n"
+            f"  dist:     {dist_str} m\n"
+            f"  time:     {time_str} s\n"
+            f"  velocity: {vel_str} km/h"
+        )
+        self.ax.text(
+            0.98, 0.98, text,
+            transform=self.ax.transAxes,
+            fontsize=8, fontfamily="monospace",
+            verticalalignment="top", horizontalalignment="right",
+            bbox=dict(boxstyle="round", facecolor="lightcyan", alpha=0.9),
+        )
+
     def show_label_prompt(self):
         """Show the label selection prompt after Enter is pressed."""
         self.ax.set_title(
-            "SELECT LABEL:  [1] GSD  [2] GG  [3] TS  [4] TG  [5] Other",
+            "SELECT LABEL:  [1] GSD  [2] GG  [3] TS  [4] TG  [5] Mixed  [6] Other",
             fontsize=12, fontfamily="monospace", color="darkblue",
         )
         self.fig.canvas.draw_idle()
@@ -691,7 +735,7 @@ class LabelController:
         if start_in_label_mode:
             self.selecting_label = True
             self.renderer.show_label_prompt()
-            print(f"  Select label: 1=GSD 2=GG 3=TS 4=TG 5=Other")
+            print(f"  Select label: 1=GSD 2=GG 3=TS 4=TG 5=Mixed 6=Other")
             print(f"  (Backspace to re-edit path)")
 
     def on_key(self, event):
@@ -761,7 +805,7 @@ class LabelController:
         elif action == "save":
             self.selecting_label = True
             self.renderer.show_label_prompt()
-            print(f"  Select label: 1=GSD 2=GG 3=TS 4=TG 5=Other")
+            print(f"  Select label: 1=GSD 2=GG 3=TS 4=TG 5=Mixed 6=Other")
             print(f"  (Backspace to cancel)")
 
     def _finalize(self, label):
@@ -777,17 +821,33 @@ class LabelController:
             traj_list = [[float(p[0]), float(p[1])] for p in state.path_history]
         match_rate = state.current_match_rate()
 
-        record = {
-            "episode": self.current_idx,
-            "order": state.order,
-            "mode": state.mode,
-            "label": label,
-            "reward": 0.0,
-            "success": 1 if state.reached else 0,
-            "match": match_rate,
-            "steps": state.step_count,
-            "traj": json.dumps(traj_list, ensure_ascii=False),
-        }
+        row = state.row
+
+        record = {"order": state.order}
+
+        if state.is_hex:
+            record["idx_o"] = row.get("idx_o", row.get("idx", ""))
+
+        record["success"] = 1 if state.reached else 0
+        record["match"] = match_rate
+        record["steps"] = state.step_count
+        record["traj"] = json.dumps(traj_list, ensure_ascii=False)
+
+        if state.is_hex:
+            record["stime_o"] = row.get("stime_o", "")
+            record["lat_o"] = row.get("lat_o", "")
+            record["lon_o"] = row.get("lon_o", "")
+            record["hex_x_o"] = row.get("x_o", "")
+            record["hex_y_o"] = row.get("y_o", "")
+            record["hex_z_o"] = row.get("z_o", "")
+            record["hex_x_d"] = row.get("x_d", "")
+            record["hex_y_d"] = row.get("y_d", "")
+            record["hex_z_d"] = row.get("z_d", "")
+            record["time_d"] = row.get("time_d", "")
+            record["dist_d"] = row.get("dist_d", "")
+            record["velocity_d"] = row.get("velocity_d", "")
+
+        record["mode"] = label
 
         df_new = pd.DataFrame([record])
         if os.path.exists(csv_path):
