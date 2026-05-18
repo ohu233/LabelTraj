@@ -626,10 +626,10 @@ class PathRenderer:
     def _draw_legend_box(self):
         text = (
             "Keys:\n"
-            "  Arrow / WASD   move\n"
-            "  Backspace      undo\n"
-            "  R              reset\n"
-            "  Enter          save & label"
+            "  Arrow / QWEASD   move\n"
+            "  Backspace        undo\n"
+            "  R                reset\n"
+            "  Enter            save & label"
         )
         self.ax.text(
             0.02, 0.98, text,
