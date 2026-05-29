@@ -1,5 +1,5 @@
 """
-统一底图渲染：OSM 道路瓦片或旧 JPEG 底图。
+底图渲染：高德道路瓦片底图 (GCJ-02 坐标系)。
 """
 
 import matplotlib.pyplot as plt
@@ -9,32 +9,32 @@ import xyzservices
 
 from utils.geo_utils import full_grid_bounds_mercator
 
-# 设为 False 可回退到旧 JPEG 底图
-USE_OSM_BASEMAP = True
+USE_BASEMAP = True
 
-OSM_PROVIDER = xyzservices.TileProvider(
-    url="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-    max_zoom=19,
+# 高德瓦片 (GCJ-02 火星坐标系)
+GAODE_PROVIDER = xyzservices.TileProvider(
+    url="https://webrd04.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}",
+    max_zoom=18,
     min_zoom=0,
-    attribution="(C) OpenStreetMap contributors",
-    name="OpenStreetMap.Mapnik",
+    attribution="(C) AutoNavi",
+    name="AutoNavi.Normal",
 )
 
-# 备用 tile 源（CartoDB，在国内通常比 OSM 快）
-FALLBACK_PROVIDER = xyzservices.TileProvider(
-    url="https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
-    max_zoom=19,
+# 备用: 高德卫星图
+GAODE_SATELLITE = xyzservices.TileProvider(
+    url="https://webst04.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=6&x={x}&y={y}&z={z}",
+    max_zoom=18,
     min_zoom=0,
-    attribution="(C) CartoDB",
-    name="CartoDB.Positron",
+    attribution="(C) AutoNavi",
+    name="AutoNavi.Satellite",
 )
 
 
-def add_osm_basemap(ax, alpha=1.0, zoom=None):
-    """在给定 Axes 上叠加 OSM 道路瓦片底图。
-    先尝试 OSM，失败则尝试 CartoDB 备用源。
+def add_basemap(ax, alpha=1.0, zoom=None):
+    """在给定 Axes 上叠加高德道路瓦片底图 (GCJ-02)。
+    失败时尝试高德卫星图作为备用。
     """
-    providers = [OSM_PROVIDER, FALLBACK_PROVIDER]
+    providers = [GAODE_PROVIDER, GAODE_SATELLITE]
     last_err = None
     for provider in providers:
         try:
@@ -46,19 +46,23 @@ def add_osm_basemap(ax, alpha=1.0, zoom=None):
                 alpha=alpha,
                 reset_extent=False,
             )
-            return  # 成功
+            return
         except Exception as e:
             last_err = e
-    # 全部失败时仅打印警告，不做额外处理
     print(f"  [WARN] All tile providers failed: {last_err}")
+
+
+# ---- 兼容旧 API ----
+add_osm_basemap = add_basemap
+USE_OSM_BASEMAP = USE_BASEMAP
 
 
 def set_ax_extent(ax, xmin, xmax, ymin, ymax):
     """设置 Axes 范围并添加底图。坐标需为 Web Mercator (EPSG:3857)。"""
     ax.set_xlim(xmin, xmax)
     ax.set_ylim(ymin, ymax)
-    if USE_OSM_BASEMAP:
-        add_osm_basemap(ax)
+    if USE_BASEMAP:
+        add_basemap(ax)
     else:
         _add_jpeg_fallback(ax)
     ax.set_aspect("equal")

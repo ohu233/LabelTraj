@@ -47,8 +47,9 @@ from utils.geo_utils import (
     hex_distance,
     hex_in_map,
     _init_hex_origin,
+    mercator_wgs84_to_gcj02,
 )
-from utils.basemap import add_osm_basemap, USE_OSM_BASEMAP
+from utils.basemap import add_basemap, USE_BASEMAP
 
 from utils.tools import (
     mapdata_to_modelmatrix,
@@ -400,28 +401,39 @@ class PathRenderer:
         mx_min, mx_max, my_min, my_max = grid_bounds_to_mercator(
             grid_xmin, grid_xmax, grid_ymin, grid_ymax
         )
-        self.ax.set_xlim(mx_min, mx_max)
-        self.ax.set_ylim(my_min, my_max)
+        # GCJ-02 偏移 → 高德瓦片对齐
+        gcj_x, gcj_y = mercator_wgs84_to_gcj02(
+            [mx_min, mx_max, mx_min, mx_max],
+            [my_min, my_max, my_max, my_min],
+        )
+        self.ax.set_xlim(gcj_x.min(), gcj_x.max())
+        self.ax.set_ylim(gcj_y.min(), gcj_y.max())
         self.ax.set_aspect("equal")
 
-        if USE_OSM_BASEMAP:
+        if USE_BASEMAP:
             try:
-                add_osm_basemap(self.ax, alpha=0.8)
+                add_basemap(self.ax, alpha=0.8)
             except Exception as e:
-                print(f"  [WARN] OSM basemap load failed: {e}")
+                print(f"  [WARN] basemap load failed: {e}")
 
         road_rgb = self._build_road_rgb(raw_mapdata)
         full_mx_min, full_mx_max, full_my_min, full_my_max = full_grid_bounds_mercator()
+        gcj_fx, gcj_fy = mercator_wgs84_to_gcj02(
+            [full_mx_min, full_mx_max, full_mx_min, full_mx_max],
+            [full_my_min, full_my_max, full_my_max, full_my_min],
+        )
         self.ax.imshow(
             road_rgb,
-            extent=[full_mx_min, full_mx_max, full_my_min, full_my_max],
+            extent=[gcj_fx.min(), gcj_fx.max(), gcj_fy.min(), gcj_fy.max()],
             origin="lower",
             alpha=0.45,
             zorder=2,
         )
 
         start_mx, start_my = grid_to_mercator(state.start_x, state.start_y)
+        start_mx, start_my = mercator_wgs84_to_gcj02(start_mx, start_my)
         end_mx, end_my = grid_to_mercator(state.end_x, state.end_y)
+        end_mx, end_my = mercator_wgs84_to_gcj02(end_mx, end_my)
 
         self.start_handle = self.ax.scatter(
             start_mx, start_my,
@@ -440,6 +452,7 @@ class PathRenderer:
         )
 
         cursor_mx, cursor_my = grid_to_mercator(state.cur_x, state.cur_y)
+        cursor_mx, cursor_my = mercator_wgs84_to_gcj02(cursor_mx, cursor_my)
         self.cursor = self.ax.scatter(
             cursor_mx, cursor_my,
             c="cyan", marker="o", s=25,
@@ -463,26 +476,33 @@ class PathRenderer:
         y_range = max(abs(end_my - start_my), 12000)
 
         pad = VIEW_PADDING_METERS
+        # 保存原始 WGS84 Mercator 范围（供道路叠加层过滤使用）
         self._mx_min = x_center - x_range / 2 - pad
         self._mx_max = x_center + x_range / 2 + pad
         self._my_min = y_center - y_range / 2 - pad
         self._my_max = y_center + y_range / 2 + pad
 
-        self.ax.set_xlim(self._mx_min, self._mx_max)
-        self.ax.set_ylim(self._my_min, self._my_max)
+        # GCJ-02 偏移 → 高德瓦片对齐
+        gcj_x = [self._mx_min, self._mx_max, self._mx_min, self._mx_max]
+        gcj_y = [self._my_min, self._my_max, self._my_max, self._my_min]
+        gcj_mx, gcj_my = mercator_wgs84_to_gcj02(gcj_x, gcj_y)
+        self.ax.set_xlim(gcj_mx.min(), gcj_mx.max())
+        self.ax.set_ylim(gcj_my.min(), gcj_my.max())
         self.ax.set_aspect("equal")
 
-        if USE_OSM_BASEMAP:
+        if USE_BASEMAP:
             try:
-                add_osm_basemap(self.ax, alpha=0.8)
+                add_basemap(self.ax, alpha=0.8)
             except Exception as e:
-                print(f"  [WARN] OSM basemap load failed: {e}")
+                print(f"  [WARN] basemap load failed: {e}")
 
         # 道路叠加层：每个模式用散点图
         if self.road_sets is not None:
             self._build_hex_road_overlay(raw_mapdata)
 
-        # 起终点标记
+        # 起终点标记（GCJ-02 偏移）
+        start_mx, start_my = mercator_wgs84_to_gcj02(start_mx, start_my)
+        end_mx, end_my = mercator_wgs84_to_gcj02(end_mx, end_my)
         self.start_handle = self.ax.scatter(
             start_mx, start_my,
             c="limegreen", marker="o", s=180,
@@ -500,6 +520,7 @@ class PathRenderer:
         )
 
         cursor_mx, cursor_my = hex_to_mercator(*state.cur)
+        cursor_mx, cursor_my = mercator_wgs84_to_gcj02(cursor_mx, cursor_my)
         self.cursor = self.ax.scatter(
             cursor_mx, cursor_my,
             c="cyan", marker="o", s=25,
@@ -577,8 +598,9 @@ class PathRenderer:
 
             if mx_list:
                 r, g, b = mode_rgb.get(mode_name, (0.5, 0.5, 0.5))
+                gx, gy = mercator_wgs84_to_gcj02(mx_list, my_list)
                 self.ax.scatter(
-                    mx_list, my_list,
+                    gx, gy,
                     c=[(r, g, b)], s=6, alpha=0.55,
                     marker='h', zorder=2, label=mode_name,
                 )
@@ -588,7 +610,7 @@ class PathRenderer:
 
         The Beijing 1954 GK grid is rotated ~4.5° relative to the Mercator
         axes at this longitude.  A plain imshow with a rectangular extent
-        cannot represent that rotation, producing km-scale offsets from OSM
+        cannot represent that rotation, producing km-scale offsets from web map
         tiles.  Resampling onto a regular Mercator grid fixes the alignment.
         """
         matrices = mapdata_to_modelmatrix(raw_mapdata, MAP_ROWS, MAP_COLS)
@@ -713,12 +735,14 @@ class PathRenderer:
             xs = [p[0] for p in state.path_history]
             ys = [p[1] for p in state.path_history]
             merc_x, merc_y = grid_to_mercator(xs, ys)
+        merc_x, merc_y = mercator_wgs84_to_gcj02(merc_x, merc_y)
         self.path_line.set_data(merc_x, merc_y)
 
         if self.is_hex:
             cursor_mx, cursor_my = hex_to_mercator(*state.cur)
         else:
             cursor_mx, cursor_my = grid_to_mercator(state.cur_x, state.cur_y)
+        cursor_mx, cursor_my = mercator_wgs84_to_gcj02(cursor_mx, cursor_my)
         self.cursor.set_offsets([[cursor_mx, cursor_my]])
         self._update_title()
         self.fig.canvas.draw_idle()

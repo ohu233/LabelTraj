@@ -229,3 +229,64 @@ def hex_distance(a, b):
 def hex_in_map(x, y, z, hex_grid):
     """检查 (x,y,z) 是否在 hex_grid 字典范围内"""
     return (int(x), int(y), int(z)) in hex_grid
+
+
+# ============================================================
+# GCJ-02 (火星坐标系) 转换
+# 高德/腾讯地图使用 GCJ-02，与 WGS84 有 100-700m 非线性偏移
+# ============================================================
+import math as _math
+
+_GCJ_A = 6378245.0
+_GCJ_EE = 0.00669342162296594323
+
+
+def _gcj_delta(lon, lat):
+    """计算 GCJ-02 相对于 WGS84 的偏移量 (度)"""
+    x = np.asarray(lon, dtype=np.float64) - 105.0
+    y = np.asarray(lat, dtype=np.float64) - 35.0
+
+    dlat = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * np.sqrt(np.abs(x))
+    dlat += (20.0 * np.sin(6.0 * x * _math.pi) + 20.0 * np.sin(2.0 * x * _math.pi)) * 2.0 / 3.0
+    dlat += (20.0 * np.sin(y * _math.pi) + 40.0 * np.sin(y / 3.0 * _math.pi)) * 2.0 / 3.0
+    dlat += (160.0 * np.sin(y / 12.0 * _math.pi) + 320.0 * np.sin(y * _math.pi / 30.0)) * 2.0 / 3.0
+
+    dlon = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * np.sqrt(np.abs(x))
+    dlon += (20.0 * np.sin(6.0 * x * _math.pi) + 20.0 * np.sin(2.0 * x * _math.pi)) * 2.0 / 3.0
+    dlon += (20.0 * np.sin(x * _math.pi) + 40.0 * np.sin(x / 3.0 * _math.pi)) * 2.0 / 3.0
+    dlon += (150.0 * np.sin(x / 12.0 * _math.pi) + 300.0 * np.sin(x / 30.0 * _math.pi)) * 2.0 / 3.0
+
+    radlat = lat / 180.0 * _math.pi
+    magic = np.sin(radlat)
+    magic = 1.0 - _GCJ_EE * magic * magic
+    sqrtmagic = np.sqrt(magic)
+    dlat = (dlat * 180.0) / ((_GCJ_A * (1.0 - _GCJ_EE)) / (magic * sqrtmagic) * _math.pi)
+    dlon = (dlon * 180.0) / (_GCJ_A / sqrtmagic * np.cos(radlat) * _math.pi)
+    return dlon, dlat
+
+
+def wgs84_to_gcj02(lon, lat):
+    """WGS84 (EPSG:4326) → GCJ-02 火星坐标系"""
+    dlon, dlat = _gcj_delta(lon, lat)
+    return np.asarray(lon, dtype=np.float64) + dlon, np.asarray(lat, dtype=np.float64) + dlat
+
+
+def gcj02_to_wgs84(lon, lat):
+    """GCJ-02 → WGS84 (迭代逆变换)"""
+    lon_arr = np.asarray(lon, dtype=np.float64)
+    lat_arr = np.asarray(lat, dtype=np.float64)
+    wgs_lon, wgs_lat = lon_arr.copy(), lat_arr.copy()
+    for _ in range(10):
+        gcj_lon, gcj_lat = wgs84_to_gcj02(wgs_lon, wgs_lat)
+        wgs_lon -= gcj_lon - lon_arr
+        wgs_lat -= gcj_lat - lat_arr
+    return wgs_lon, wgs_lat
+
+
+def mercator_wgs84_to_gcj02(mx, my):
+    """Web Mercator WGS84 坐标 → GCJ-02 偏移后的 Mercator 坐标"""
+    lon, lat = _merc_to_wgs84.transform(np.asarray(mx, dtype=np.float64),
+                                          np.asarray(my, dtype=np.float64))
+    gcj_lon, gcj_lat = wgs84_to_gcj02(lon, lat)
+    gx, gy = _wgs84_to_merc.transform(gcj_lon, gcj_lat)
+    return gx, gy
