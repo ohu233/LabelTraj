@@ -203,11 +203,6 @@ def load_traj_csv_hex(path, sample_step=10):
             for i in range(len(sampled_indices) - 1):
                 a = group.iloc[sampled_indices[i]]
                 b = group.iloc[sampled_indices[i + 1]]
-                # 跳过起终点相同的零距离段
-                if (int(a["hex_x"]) == int(b["hex_x"]) and
-                    int(a["hex_y"]) == int(b["hex_y"]) and
-                    int(a["hex_z"]) == int(b["hex_z"])):
-                    continue
                 # 间隔取行：对区间内的 time / dist 求和，velocity 重算
                 seg_rows = group.iloc[sampled_indices[i] + 1 : sampled_indices[i + 1] + 1]
                 time_sum = float(seg_rows["time_value"].sum()) if "time_value" in df.columns else 0.0
@@ -226,6 +221,7 @@ def load_traj_csv_hex(path, sample_step=10):
                     "order": int(uid),
                     "uid": int(uid),
                     "idx_o": int(a["idx"]) if "idx" in df.columns else int(a.name),
+                    "idx_d": int(b["idx"]) if "idx" in df.columns else int(b.name),
                     "stime_o": int(a["stime"]) if "stime" in df.columns else 0,
                     "lat_o": float(a["lat"]) if "lat" in df.columns else 0.0,
                     "lon_o": float(a["lon"]) if "lon" in df.columns else 0.0,
@@ -339,10 +335,14 @@ class LabelState:
 class PathRenderer:
     """Manages the matplotlib figure and incremental updates (quad or hex)."""
 
-    def __init__(self, state: LabelState, raw_mapdata, road_sets=None):
+    def __init__(self, state: LabelState, raw_mapdata, road_sets=None,
+                 traj_df=None, current_idx=None, output_dir=None):
         self.state = state
         self.is_hex = state.is_hex
         self.road_sets = road_sets
+        self.traj_df = traj_df
+        self.current_idx = current_idx
+        self.output_dir = output_dir
 
         if self.is_hex:
             # 左右分栏：左侧地图，右侧速度分布
@@ -437,13 +437,13 @@ class PathRenderer:
 
         self.start_handle = self.ax.scatter(
             start_mx, start_my,
-            c="limegreen", marker="o", s=180,
-            edgecolors="darkgreen", linewidths=2, zorder=5, label="Start",
+            c="limegreen", marker="o", s=60,
+            edgecolors="darkgreen", linewidths=1.2, zorder=5, label="Start",
         )
         self.end_handle = self.ax.scatter(
             end_mx, end_my,
-            c="red", marker="X", s=180,
-            edgecolors="darkred", linewidths=2, zorder=5, label="End",
+            c="red", marker="X", s=60,
+            edgecolors="darkred", linewidths=1.2, zorder=5, label="End",
         )
 
         (self.path_line,) = self.ax.plot(
@@ -505,13 +505,13 @@ class PathRenderer:
         end_mx, end_my = mercator_wgs84_to_gcj02(end_mx, end_my)
         self.start_handle = self.ax.scatter(
             start_mx, start_my,
-            c="limegreen", marker="o", s=180,
-            edgecolors="darkgreen", linewidths=2, zorder=5, label="Start",
+            c="limegreen", marker="o", s=20,
+            edgecolors="darkgreen", linewidths=1.2, zorder=5, label="Start",
         )
         self.end_handle = self.ax.scatter(
             end_mx, end_my,
-            c="red", marker="X", s=180,
-            edgecolors="darkred", linewidths=2, zorder=5, label="End",
+            c="red", marker="X", s=20,
+            edgecolors="darkred", linewidths=1.2, zorder=5, label="End",
         )
 
         (self.path_line,) = self.ax.plot(
@@ -523,12 +523,101 @@ class PathRenderer:
         cursor_mx, cursor_my = mercator_wgs84_to_gcj02(cursor_mx, cursor_my)
         self.cursor = self.ax.scatter(
             cursor_mx, cursor_my,
-            c="cyan", marker="o", s=25,
+            c="cyan", marker="o", s=20,
             edgecolors="darkblue", linewidths=1.5, zorder=6, label="Cursor",
         )
 
+        # ---- 上下文参考点（前一段起点 / 后一段终点）----
+        self._draw_context_points(state)
+
         # ---- 右侧：速度分布直方图 ----
         self._draw_velocity_hist(state)
+
+    def _draw_context_points(self, state):
+        """绘制同一 uid 相邻段的参考点及已标注路径"""
+        if self.traj_df is None or self.current_idx is None:
+            return
+
+        idx = self.current_idx
+        traj_df = self.traj_df
+
+        # 前一段的起点（前一个点）
+        if idx > 0:
+            prev_row = traj_df.iloc[idx - 1]
+            if int(prev_row.get("uid", -1)) == state.uid:
+                if state.is_hex:
+                    pt = (int(prev_row["x_o"]), int(prev_row["y_o"]), int(prev_row["z_o"]))
+                    mx, my = hex_to_mercator(*pt)
+                else:
+                    mx, my = grid_to_mercator(float(prev_row["locx_o"]), float(prev_row["locy_o"]))
+                mx, my = mercator_wgs84_to_gcj02(mx, my)
+                self.ax.scatter(
+                    mx, my,
+                    c="orange", marker="D", s=20,
+                    edgecolors="darkorange", linewidths=1, zorder=4,
+                )
+                self._draw_labeled_path(state, prev_row)
+
+        # 后一段的终点（后一个点）
+        if idx < len(traj_df) - 1:
+            next_row = traj_df.iloc[idx + 1]
+            if int(next_row.get("uid", -1)) == state.uid:
+                if state.is_hex:
+                    pt = (int(next_row["x_d"]), int(next_row["y_d"]), int(next_row["z_d"]))
+                    mx, my = hex_to_mercator(*pt)
+                else:
+                    mx, my = grid_to_mercator(float(next_row["locx_d"]), float(next_row["locy_d"]))
+                mx, my = mercator_wgs84_to_gcj02(mx, my)
+                self.ax.scatter(
+                    mx, my,
+                    c="deepskyblue", marker="D", s=20,
+                    edgecolors="blue", linewidths=1, zorder=4,
+                )
+                self._draw_labeled_path(state, next_row)
+
+    def _draw_labeled_path(self, state, adj_row):
+        """如果相邻段已被标注，将其路径画在图上"""
+        uid_val = int(adj_row.get("uid", -1))
+        idx_o_val = adj_row.get("idx_o", None)
+        if idx_o_val is None:
+            return
+        labeled_csv = os.path.join(self.output_dir, "traj_labeled.csv")
+        if not os.path.exists(labeled_csv):
+            return
+        try:
+            labeled_df = pd.read_csv(labeled_csv, encoding="utf-8")
+        except Exception:
+            return
+        if labeled_df.empty:
+            return
+        match = labeled_df[
+            (labeled_df["uid"] == uid_val) & (labeled_df["idx_o"] == int(idx_o_val))
+        ]
+        if match.empty:
+            return
+        traj_str = match.iloc[0].get("traj", "")
+        if not traj_str or not isinstance(traj_str, str):
+            return
+        try:
+            pts = json.loads(traj_str)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if len(pts) < 2:
+            return
+        if state.is_hex:
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            zs = [p[2] for p in pts]
+            merc_x, merc_y = hex_to_mercator(xs, ys, zs)
+        else:
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            merc_x, merc_y = grid_to_mercator(xs, ys)
+        merc_x, merc_y = mercator_wgs84_to_gcj02(merc_x, merc_y)
+        self.ax.plot(
+            merc_x, merc_y, "--",
+            color="crimson", linewidth=2, alpha=0.5, zorder=3,
+        )
 
     def _draw_velocity_hist(self, state):
         """在右侧子图绘制当前 uid 的速度分布直方图"""
@@ -601,7 +690,7 @@ class PathRenderer:
                 gx, gy = mercator_wgs84_to_gcj02(mx_list, my_list)
                 self.ax.scatter(
                     gx, gy,
-                    c=[(r, g, b)], s=6, alpha=0.55,
+                    c=[(r, g, b)], s=6, alpha=0.5,
                     marker='h', zorder=2, label=mode_name,
                 )
 
@@ -857,33 +946,24 @@ class LabelController:
 
         row = state.row
 
-        record = {"order": state.order}
-
-        if state.is_hex:
-            record["idx_o"] = row.get("idx_o", row.get("idx", ""))
+        # 全量原始字段（排除 order 和 mode）
+        skip_cols = {"order", "mode"}
+        record = {}
+        for col in row.index:
+            if col not in skip_cols:
+                record[col] = row[col]
 
         record["success"] = 1 if state.reached else 0
         record["match"] = match_rate
         record["steps"] = state.step_count
         record["traj"] = json.dumps(traj_list, ensure_ascii=False)
-
-        if state.is_hex:
-            record["stime_o"] = row.get("stime_o", "")
-            record["lat_o"] = row.get("lat_o", "")
-            record["lon_o"] = row.get("lon_o", "")
-            record["hex_x_o"] = row.get("x_o", "")
-            record["hex_y_o"] = row.get("y_o", "")
-            record["hex_z_o"] = row.get("z_o", "")
-            record["hex_x_d"] = row.get("x_d", "")
-            record["hex_y_d"] = row.get("y_d", "")
-            record["hex_z_d"] = row.get("z_d", "")
-            record["time_d"] = row.get("time_d", "")
-            record["dist_d"] = row.get("dist_d", "")
-            record["velocity_d"] = row.get("velocity_d", "")
-
         record["mode"] = label
 
         df_new = pd.DataFrame([record])
+        # uid, idx_o, idx_d 放前三列
+        front_cols = [c for c in ["uid", "idx_o", "idx_d"] if c in df_new.columns]
+        other_cols = [c for c in df_new.columns if c not in front_cols]
+        df_new = df_new[front_cols + other_cols]
         if os.path.exists(csv_path):
             df_new.to_csv(csv_path, mode="a", index=False, header=False, encoding="utf-8")
         else:
@@ -899,9 +979,11 @@ class LabelController:
 # ========================== Main Loop ==========================
 
 def run_single(state, raw_mapdata, output_dir, batch_mode, idx,
-               start_in_label_mode=False, road_sets=None):
+               start_in_label_mode=False, road_sets=None, traj_df=None):
     """Run labeling for one trajectory. Returns (next_idx, keep_going)."""
-    renderer = PathRenderer(state, raw_mapdata, road_sets=road_sets)
+    renderer = PathRenderer(state, raw_mapdata, road_sets=road_sets,
+                            traj_df=traj_df, current_idx=idx,
+                            output_dir=output_dir)
     controller = LabelController(
         state, renderer, output_dir, batch_mode, idx,
         start_in_label_mode=start_in_label_mode,
@@ -1005,7 +1087,7 @@ def main():
             sys.exit(1)
         state = make_state(traj_df.iloc[args.index])
         run_single(state, raw_mapdata, output_dir, batch_mode=False,
-                   idx=args.index, road_sets=road_sets)
+                   idx=args.index, road_sets=road_sets, traj_df=traj_df)
 
     elif args.batch:
         idx = 0
@@ -1013,7 +1095,7 @@ def main():
             state = make_state(traj_df.iloc[idx])
             next_idx, keep_going = run_single(
                 state, raw_mapdata, output_dir, batch_mode=True,
-                idx=idx, road_sets=road_sets,
+                idx=idx, road_sets=road_sets, traj_df=traj_df,
             )
             if not keep_going:
                 print(f"Labeling stopped, completed up to #{idx}")
@@ -1024,7 +1106,7 @@ def main():
                 state = make_state(traj_df.iloc[idx])
                 next_idx, keep_going = run_single(
                     state, raw_mapdata, output_dir, batch_mode=True,
-                    idx=idx, road_sets=road_sets,
+                    idx=idx, road_sets=road_sets, traj_df=traj_df,
                     start_in_label_mode=True,
                 )
                 if not keep_going:
@@ -1058,7 +1140,7 @@ def main():
             state = make_state(traj_df.iloc[idx])
             next_idx, keep_going = run_single(
                 state, raw_mapdata, output_dir, batch_mode=True,
-                idx=idx, road_sets=road_sets,
+                idx=idx, road_sets=road_sets, traj_df=traj_df,
             )
             if not keep_going:
                 print(f"Labeling stopped, completed up to #{idx}")
@@ -1069,7 +1151,7 @@ def main():
                 state = make_state(traj_df.iloc[idx])
                 next_idx, keep_going = run_single(
                     state, raw_mapdata, output_dir, batch_mode=True,
-                    idx=idx, road_sets=road_sets,
+                    idx=idx, road_sets=road_sets, traj_df=traj_df,
                     start_in_label_mode=True,
                 )
                 if not keep_going:

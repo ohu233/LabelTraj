@@ -24,11 +24,11 @@ def mapdata_to_modelmatrix(mapdata: dict, n_row, n_col) -> dict[str: list[list[i
     }
     for k,v in mapdata.items():
         try:
-            if v[4] & 1 == 1 or v[4] >>1 &1 == 1:
+            if v[4] >> 6 & 1 == 1:
                 modelmatrix['TG'][k[0]][k[1]] = 1
-            if v[4] & 1 == 1 or v[4] >>6 &1 == 1 or v[4] >>1 &1 == 1:
+            if v[4] >> 1 & 1 == 1:
                 modelmatrix['TS'][k[0]][k[1]] = 1
-            if v[4] >>3 & 1 == 1:
+            if v[4] >> 4 & 1 == 1 or v[4] >> 3 & 1 == 1:
                 modelmatrix['GG'][k[0]][k[1]] = 1
             if v[4] >>2 & 1 == 1 or v[4] >>5 & 1 == 1:
                 modelmatrix['GSD'][k[0]][k[1]] = 1
@@ -186,10 +186,10 @@ def plt_multi_map(modes: List[str]):
 # ============================================================
 
 HEX_MODE_BITS = {
-    "TG":  0b00001000,   # bit 3: has_gs（高速）
-    "GG":  0b00000010,   # bit 1: has_gt（高铁）
-    "GSD": 0b00100100,   # bit 2+5: has_gd + has_sd（国道+省道）
-    "TS":  0b01000000,   # bit 6: has_pt（普铁）
+    "TG":  0b01000000,   # bit 6: has_gt（高铁）
+    "GG":  0b00011000,   # bit 3+4: has_gs_sfz + has_gs（高速）
+    "GSD": 0b00100100,   # bit 2+5: has_sd + has_gd（省道+国道）
+    "TS":  0b00000010,   # bit 1: has_pt（普铁）
 }
 
 

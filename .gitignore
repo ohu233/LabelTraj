@@ -1,5 +1,6 @@
 data/
 .vscode/
+.codegraph/
 __pycache__/
 label_output/
 map-processor/
