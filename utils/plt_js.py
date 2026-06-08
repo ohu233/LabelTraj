@@ -18,12 +18,13 @@ with open(r"data\GridModesAdjacentRealworld.pkl", "rb") as f:
 matrice = mapdata_to_modelmatrix(mapdata, 529, 564)
 
 # 2) base config
-modes = ["TG", "GG", "GSD", "TS"]
+modes = ["TG", "GG", "GSD", "TS", "XD"]
 mode_colors = {
     "TG": "orange",
     "GG": "blue",
     "GSD": "green",
     "TS": "red",
+    "XD": "cyan",
 }
 
 bg_path = r"figur\jiangsu\js.jpg"

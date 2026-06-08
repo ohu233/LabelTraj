@@ -9,7 +9,7 @@ from utils.tools import mapdata_to_modelmatrix, get_patch, state_to_vector, calc
 
 # global variables
 dxdy_dict = {0: (1, 0), 1: (0, 1), 2: (-1, 0), 3: (0, -1)}
-modelist = ['GSD', 'GG', 'TS', 'TG']
+modelist = ['GSD', 'GG', 'TS', 'TG', 'XD']
 
 with open('data/GridModesAdjacentRealworld.pkl', 'rb') as f:
     mapdata = pickle.load(f)

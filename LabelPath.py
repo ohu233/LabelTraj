@@ -92,11 +92,12 @@ MODE_COLORS = {
     "GG": "blue",
     "GSD": "green",
     "TS": "red",
+    "XD": "cyan",
 }
-MODE_LIST = ["GSD", "GG", "TS", "TG"]
+MODE_LIST = ["GSD", "GG", "TS", "TG", "XD"]
 
 DEFAULT_MAPDATA_PATH = "data/GridModesAdjacentRealworld.pkl"
-DEFAULT_CSV_PATH = "data\dataset_20230917_nanjing_to_gaochun_lishui_with_hex.csv"
+DEFAULT_CSV_PATH = "data\dataset_20230917_nanjing_to_gaochun_lishui_with_hex_downsampled.csv"
 DEFAULT_OUTPUT_DIR = "label_output"
 
 DISTANCE_THRESHOLD = 1.0

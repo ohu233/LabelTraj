@@ -8,7 +8,7 @@ import warnings
 from PIL import Image
 warnings.simplefilter("ignore", Image.DecompressionBombWarning)
 
-MODE_LIST = ["GSD", "GG", "TS", "TG"]
+MODE_LIST = ["GSD", "GG", "TS", "TG", "XD"]
 
 def mapdata_to_modelmatrix(mapdata: dict, n_row, n_col) -> dict[str: list[list[int]]]:
     """
@@ -20,7 +20,8 @@ def mapdata_to_modelmatrix(mapdata: dict, n_row, n_col) -> dict[str: list[list[i
     modelmatrix = {"TG": [[0 for _ in range(n_row)] for _ in range(n_col)],
                     "GG": [[0 for _ in range(n_row)] for _ in range(n_col)],
                     "GSD": [[0 for _ in range(n_row)] for _ in range(n_col)],
-                    "TS": [[0 for _ in range(n_row)] for _ in range(n_col)]
+                    "TS": [[0 for _ in range(n_row)] for _ in range(n_col)],
+                    "XD": [[0 for _ in range(n_row)] for _ in range(n_col)]
     }
     for k,v in mapdata.items():
         try:
@@ -32,6 +33,8 @@ def mapdata_to_modelmatrix(mapdata: dict, n_row, n_col) -> dict[str: list[list[i
                 modelmatrix['GG'][k[0]][k[1]] = 1
             if v[4] >>2 & 1 == 1 or v[4] >>5 & 1 == 1:
                 modelmatrix['GSD'][k[0]][k[1]] = 1
+            if v[4] >> 7 & 1 == 1:
+                modelmatrix['XD'][k[0]][k[1]] = 1
         except:
 
             print('Input Data Out of Range: ',k,v, 'Map Size: ', n_row, n_col)
@@ -127,7 +130,7 @@ def plt_multi_map(modes: List[str]):
     if modes is None:
         raise ValueError("modes 不能为空，例如 ['TG', 'GG']")
 
-    valid_modes = {"TG", "GG", "GSD", "TS"}
+    valid_modes = {"TG", "GG", "GSD", "TS", "XD"}
     invalid = [m for m in modes if m not in valid_modes]
     if invalid:
         raise ValueError(f"不支持的 mode: {invalid}，可选: {sorted(valid_modes)}")
@@ -142,6 +145,7 @@ def plt_multi_map(modes: List[str]):
         "GG": "blue",
         "GSD": "green",
         "TS": "red",
+        "XD": "cyan",
     }
 
     # 固定底图，不改
@@ -190,6 +194,7 @@ HEX_MODE_BITS = {
     "GG":  0b00011000,   # bit 3+4: has_gs_sfz + has_gs（高速）
     "GSD": 0b00100100,   # bit 2+5: has_sd + has_gd（省道+国道）
     "TS":  0b00000010,   # bit 1: has_pt（普铁）
+    "XD":  0b10000000,   # bit 7: has_xd（县道）
 }
 
 
