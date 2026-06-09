@@ -72,6 +72,10 @@ _wgs84_to_merc = pyproj.Transformer.from_crs(_wgs84_crs, _web_mercator_crs, alwa
 _merc_to_wgs84 = pyproj.Transformer.from_crs(_web_mercator_crs, _wgs84_crs, always_xy=True)
 
 
+# ============================================================
+# 网格 ↔ WGS84 ↔ Mercator（basemap.py 通过 full_grid_bounds_mercator 依赖此链）
+# ============================================================
+
 def grid_to_beijing(grid_x, grid_y):
     """网格坐标 → Beijing 1954 米制坐标 (cell 中心)"""
     bx = X_MIN + (np.asarray(grid_x) + 0.5) * GRID_SIZE
@@ -206,19 +210,6 @@ def hex_to_mercator(x, y, z):
     lon, lat = hex_to_wgs84(x, y, z)
     mx, my = _wgs84_to_merc.transform(np.asarray(lon), np.asarray(lat))
     return mx, my
-
-
-def hex_neighbors(x, y, z):
-    """返回平顶六边形 (x,y,z) 的 6 个邻居坐标列表"""
-    offsets = [
-        (1, -1, 0),   # 0: 东/右
-        (1, 0, -1),   # 1: 东北
-        (0, 1, -1),   # 2: 西北/上
-        (-1, 1, 0),   # 3: 西/左
-        (-1, 0, 1),   # 4: 西南
-        (0, -1, 1),   # 5: 东南/下
-    ]
-    return [(x + dx, y + dy, z + dz) for dx, dy, dz in offsets]
 
 
 def hex_distance(a, b):
