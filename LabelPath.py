@@ -73,6 +73,9 @@ DEFAULT_OUTPUT_DIR = "label_output"
 
 DISTANCE_THRESHOLD = 1.0
 
+# 前后参考段数（同一 uid 相邻段，用于绘制上下文 OD 链）
+CONTEXT_NEIGHBORS = 7
+
 # Label options after saving (press 1-6 to select)
 LABEL_OPTIONS = {
     "1": "GSD",
@@ -339,79 +342,70 @@ class PathRenderer:
         self._draw_velocity_hist(state)
 
     def _draw_context_points(self, state):
-        """绘制同一 uid 相邻段的参考点及已标注路径"""
+        """绘制同一 uid 前后若干段的参考点，并用灰色虚线顺序连接。
+
+        OD 链按时间顺序排列：
+          [前n起点, ..., 前1起点, 当前起点, 当前终点, 下1终点, ..., 下n终点]
+        - 前链：前段起点序列 + 当前起点 → 灰色虚线，橙色菱形标前段起点；
+        - 后链：当前终点 + 下1~下n终点 → 灰色虚线，天蓝色菱形标后段终点。
+        """
         if self.traj_df is None or self.current_idx is None:
             return
 
-        idx = self.current_idx
         traj_df = self.traj_df
+        idx = self.current_idx
 
-        # 前一段的起点（前一个点）
-        if idx > 0:
-            prev_row = traj_df.iloc[idx - 1]
-            if int(prev_row.get("uid", -1)) == state.uid:
-                pt = (int(prev_row["x_o"]), int(prev_row["y_o"]), int(prev_row["z_o"]))
-                mx, my = hex_to_mercator(*pt)
-                mx, my = mercator_wgs84_to_gcj02(mx, my)
-                self.ax.scatter(
-                    mx, my,
-                    c="orange", marker="D", s=20,
-                    edgecolors="darkorange", linewidths=1, zorder=4,
+        def _proj(xyz):
+            mx, my = hex_to_mercator(*xyz)
+            mx, my = mercator_wgs84_to_gcj02(mx, my)
+            return (float(mx), float(my))
+
+        # ---- 前段 OD 链（远→近）：[前n起点, ..., 前1起点, 当前起点] ----
+        front_xyz = [(int(state.start[0]), int(state.start[1]), int(state.start[2]))]
+        for i in range(idx - 1, max(idx - CONTEXT_NEIGHBORS - 1, -1), -1):
+            row_i = traj_df.iloc[i]
+            if int(row_i.get("uid", -1)) != state.uid:
+                break
+            front_xyz.insert(0, (int(row_i["x_o"]), int(row_i["y_o"]), int(row_i["z_o"])))
+
+        # ---- 后段 OD 链：[当前终点, 下1终点, ..., 下n终点] ----
+        back_xyz = [(int(state.end[0]), int(state.end[1]), int(state.end[2]))]
+        for i in range(idx + 1, min(idx + CONTEXT_NEIGHBORS + 1, len(traj_df))):
+            row_i = traj_df.iloc[i]
+            if int(row_i.get("uid", -1)) != state.uid:
+                break
+            back_xyz.append((int(row_i["x_d"]), int(row_i["y_d"]), int(row_i["z_d"])))
+
+        front_chain = [_proj(p) for p in front_xyz]  # 末尾为当前起点
+        back_chain = [_proj(p) for p in back_xyz]     # 起点为当前终点
+
+        # ---- 灰色虚线顺序连接 ----
+        for chain in (front_chain, back_chain):
+            if len(chain) >= 2:
+                xs = [p[0] for p in chain]
+                ys = [p[1] for p in chain]
+                self.ax.plot(
+                    xs, ys, "--",
+                    color="dimgray", linewidth=1.2,
+                    alpha=0.7, zorder=3,
                 )
-                self._draw_labeled_path(prev_row)
 
-        # 后一段的终点（后一个点）
-        if idx < len(traj_df) - 1:
-            next_row = traj_df.iloc[idx + 1]
-            if int(next_row.get("uid", -1)) == state.uid:
-                pt = (int(next_row["x_d"]), int(next_row["y_d"]), int(next_row["z_d"]))
-                mx, my = hex_to_mercator(*pt)
-                mx, my = mercator_wgs84_to_gcj02(mx, my)
-                self.ax.scatter(
-                    mx, my,
-                    c="deepskyblue", marker="D", s=20,
-                    edgecolors="blue", linewidths=1, zorder=4,
-                )
-                self._draw_labeled_path(next_row)
+        # ---- 参考点（不含当前段起止点，它们由 start/end_handle 负责）----
+        prev_pts = front_chain[:-1]   # 前段起点（去掉当前起点）
+        next_pts = back_chain[1:]     # 后段终点（去掉当前终点）
 
-    def _draw_labeled_path(self, adj_row):
-        """如果相邻段已被标注，将其路径画在图上"""
-        uid_val = int(adj_row.get("uid", -1))
-        idx_o_val = adj_row.get("idx_o", None)
-        if idx_o_val is None:
-            return
-        labeled_csv = os.path.join(self.output_dir, "traj_labeled.csv")
-        if not os.path.exists(labeled_csv):
-            return
-        try:
-            labeled_df = pd.read_csv(labeled_csv, encoding="utf-8")
-        except Exception:
-            return
-        if labeled_df.empty:
-            return
-        match = labeled_df[
-            (labeled_df["uid"] == uid_val) & (labeled_df["idx_o"] == int(idx_o_val))
-        ]
-        if match.empty:
-            return
-        traj_str = match.iloc[0].get("traj", "")
-        if not traj_str or not isinstance(traj_str, str):
-            return
-        try:
-            pts = json.loads(traj_str)
-        except (json.JSONDecodeError, TypeError):
-            return
-        if len(pts) < 2:
-            return
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
-        zs = [p[2] for p in pts]
-        merc_x, merc_y = hex_to_mercator(xs, ys, zs)
-        merc_x, merc_y = mercator_wgs84_to_gcj02(merc_x, merc_y)
-        self.ax.plot(
-            merc_x, merc_y, "--",
-            color="crimson", linewidth=2, alpha=0.5, zorder=3,
-        )
+        for px, py in prev_pts:
+            self.ax.scatter(
+                [px], [py],
+                c="orange", marker="D", s=20,
+                edgecolors="darkorange", linewidths=1, zorder=4,
+            )
+        for px, py in next_pts:
+            self.ax.scatter(
+                [px], [py],
+                c="deepskyblue", marker="D", s=20,
+                edgecolors="blue", linewidths=1, zorder=4,
+            )
 
     def _draw_velocity_hist(self, state):
         """在右侧子图绘制当前 uid 的速度分布直方图"""
@@ -659,7 +653,10 @@ class LabelController:
             print(f"  (Backspace to cancel)")
 
     def _finalize(self, label):
-        """Write the complete record (path + label) to CSV and PNG."""
+        """Write the complete record (path + label) to CSV and PNG.
+
+        相同 OD（uid + idx_o）采用覆盖方式更新，而非新增一行。
+        """
         state = self.state
         os.makedirs(self.output_dir, exist_ok=True)
 
@@ -684,14 +681,31 @@ class LabelController:
         record["mode"] = label
 
         df_new = pd.DataFrame([record])
-        # uid, idx_o, idx_d 放前三列
-        front_cols = [c for c in ["uid", "idx_o", "idx_d"] if c in df_new.columns]
-        other_cols = [c for c in df_new.columns if c not in front_cols]
-        df_new = df_new[front_cols + other_cols]
+
+        # 读取已有标注，按 OD（uid + idx_o）去重后再追加，实现"覆盖"语义
         if os.path.exists(csv_path):
-            df_new.to_csv(csv_path, mode="a", index=False, header=False, encoding="utf-8")
+            try:
+                existing = pd.read_csv(csv_path, encoding="utf-8")
+            except Exception:
+                existing = pd.DataFrame()
         else:
-            df_new.to_csv(csv_path, index=False, encoding="utf-8")
+            existing = pd.DataFrame()
+
+        key_cols = [c for c in ["uid", "idx_o"] if c in df_new.columns]
+        if not existing.empty and key_cols and all(c in existing.columns for c in key_cols):
+            mask = np.ones(len(existing), dtype=bool)
+            for c in key_cols:
+                mask &= (existing[c].astype(str) == str(record[c]))
+            existing = existing[~mask]
+
+        out_df = (pd.concat([existing, df_new], ignore_index=True)
+                  if not existing.empty else df_new)
+
+        # uid, idx_o, idx_d 放前三列
+        front_cols = [c for c in ["uid", "idx_o", "idx_d"] if c in out_df.columns]
+        other_cols = [c for c in out_df.columns if c not in front_cols]
+        out_df = out_df[front_cols + other_cols]
+        out_df.to_csv(csv_path, index=False, encoding="utf-8")
 
         png_name = f"ep_{self.current_idx:04d}_order_{state.order}_{label}.png"
         png_path = os.path.join(self.output_dir, png_name)
