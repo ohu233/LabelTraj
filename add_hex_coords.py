@@ -1,80 +1,80 @@
-import pickle
-import pandas as pd
+# -*- coding: utf-8 -*-
+"""从原始轨迹 CSV 的 lon/lat 计算六边形坐标 hex_x/hex_y/hex_z/hex_code。
+
+使用与标注系统同一套坐标转换（geo_utils.wgs84_to_hex，基于 hex_grid_2025.pkl
+的仿射拟合 + 查表），保证轨迹与路网渲染坐标系一致，不会飘移。
+
+输入 CSV 需包含 lon/lat 列；输出新增 hex_x/hex_y/hex_z/hex_code 列。
+
+用法:
+  python add_hex_coords.py
+  python add_hex_coords.py --csv <in.csv> --out <out.csv>
+"""
+import os
+import sys
+import argparse
+
 import numpy as np
-from pyproj import Transformer
+import pandas as pd
 
-# 加载道路编码字典 {(x,y,z): {"lon","lat","code"}}
-with open("data\hex_grid.pkl", "rb") as f:
-    grid = pickle.load(f)
-print(f"加载 pkl, {len(grid):,} 个栅格")
+# 确保能 import 项目根的 utils
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from utils import geo_utils
 
-# 与 query_hex.py 完全一致的参数
-SIDE = 200.0
-SQRT3 = np.sqrt(3)
-
-to_bj = Transformer.from_crs("EPSG:4326", "EPSG:2434", always_xy=True)
-origin_x, origin_y = to_bj.transform(114.662853, 27.441905)
+DEFAULT_CSV = r"data\dataset_20230917_nanjing_to_gaochun_lishui.csv"
+DEFAULT_OUT = r"data\dataset_20230917_nanjing_to_gaochun_lishui_with_hex.csv"
 
 
-def lonlat_to_hex(lon, lat):
-    px, py = to_bj.transform(lon, lat)
-    cx = px - origin_x
-    cy = py - origin_y
+def add_hex_coords(csv_path, out_path):
+    print(f"读取 {csv_path} ...")
+    df = pd.read_csv(csv_path)
+    print(f"  {len(df):,} 行")
 
-    q = (cx * 2.0 / 3.0) / SIDE
-    r = (-cx / 3.0 + SQRT3 / 3.0 * cy) / SIDE
+    if "lon" not in df.columns or "lat" not in df.columns:
+        raise ValueError("CSV 缺少 lon/lat 列，无法计算 hex 坐标")
 
-    s = -q - r
-    qi = round(q)
-    ri = round(r)
-    si = round(s)
+    print("加载 hex 网格（优先读 data/hex_cache.npz 缓存）...")
+    grid = geo_utils.get_hex_grid()
+    print(f"  网格 {len(grid):,} cell")
 
-    qd = abs(qi - q)
-    rd = abs(ri - r)
-    sd = abs(si - s)
+    print("计算 hex_x/hex_y/hex_z（2025 仿射坐标系统）...")
+    lons = df["lon"].to_numpy(dtype=float)
+    lats = df["lat"].to_numpy(dtype=float)
+    xs, ys, zs = geo_utils.wgs84_to_hex(lons, lats)
+    xs = np.asarray(xs, dtype=int)
+    ys = np.asarray(ys, dtype=int)
+    zs = np.asarray(zs, dtype=int)
 
-    if qd > rd and qd > sd:
-        qi = -ri - si
-    elif rd > sd:
-        ri = -qi - si
-    else:
-        si = -qi - ri
+    print("查 hex_code ...")
+    codes = np.full(len(df), -1, dtype=np.int64)
+    hit = 0
+    for i in range(len(df)):
+        key = (int(xs[i]), int(ys[i]), int(zs[i]))
+        if key in grid:
+            codes[i] = int(grid[key]["code"])
+            hit += 1
 
-    return qi, si, ri
+    df["hex_x"] = xs
+    df["hex_y"] = ys
+    df["hex_z"] = zs
+    df["hex_code"] = codes
+
+    print(f"  命中网格: {hit:,}/{len(df):,} ({hit/len(df)*100:.1f}%)")
+    print(f"  hex_x range: [{df.hex_x.min()}, {df.hex_x.max()}]")
+    print(f"  hex_z range: [{df.hex_z.min()}, {df.hex_z.max()}]")
+
+    df.to_csv(out_path, index=False, encoding="utf-8-sig")
+    print(f"已保存 -> {out_path}")
+    print(f"新增列: hex_x, hex_y, hex_z, hex_code")
 
 
-# 读取数据
-src = "data\dataset_20230917_nanjing_to_gaochun_lishui.csv"
-df = pd.read_csv(src)
-print(f"读取 {len(df)} 条记录")
+def main():
+    parser = argparse.ArgumentParser(description="从 lon/lat 计算 hex 坐标（2025 坐标系）")
+    parser.add_argument("--csv", type=str, default=DEFAULT_CSV, help="输入轨迹 CSV")
+    parser.add_argument("--out", type=str, default=DEFAULT_OUT, help="输出 CSV")
+    args = parser.parse_args()
+    add_hex_coords(args.csv, args.out)
 
-# 批量计算六边形坐标，同时查 pkl 获取 code
-hex_x, hex_y, hex_z, codes = [], [], [], []
-hit = 0
-for lon, lat in zip(df["lon"], df["lat"]):
-    x, y, z = lonlat_to_hex(lon, lat)
-    hex_x.append(x)
-    hex_y.append(y)
-    hex_z.append(z)
-    val = grid.get((x, y, z))
-    if val is not None:
-        codes.append(val["code"])
-        hit += 1
-    else:
-        codes.append(-1)  # 不在范围内的标记
 
-df["hex_x"] = hex_x
-df["hex_y"] = hex_y
-df["hex_z"] = hex_z
-df["hex_code"] = codes
-
-# 输出
-out = "data\dataset_20230917_nanjing_to_gaochun_lishui_with_hex.csv"
-df.to_csv(out, index=False, encoding="utf-8-sig")
-print(f"命中: {hit}/{len(df)} ({hit/len(df)*100:.1f}%)")
-print(f"已保存 {len(df)} 条记录到 {out}")
-print(f"新增列: hex_x, hex_y, hex_z, hex_code")
-print(f"坐标范围: x [{df.hex_x.min()}, {df.hex_x.max()}], "
-      f"y [{df.hex_y.min()}, {df.hex_y.max()}], "
-      f"z [{df.hex_z.min()}, {df.hex_z.max()}]")
-print(f"hex_code 分布: {df.hex_code.value_counts().to_dict()}")
+if __name__ == "__main__":
+    main()

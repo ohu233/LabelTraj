@@ -125,83 +125,310 @@ def full_grid_bounds_mercator():
 
 
 # ============================================================
-# 200m 平顶六边形网格坐标转换 (hex_grid.pkl)
+# 200m 平顶六边形网格坐标转换 (hex_grid_2025.pkl)
+# ------------------------------------------------------------
+# 仿照 metro 版实现，并针对全国 pkl（640 万 cell, 2.2GB）做缓存优化：
+#
+# 启动开销主要在 pickle.load(2.2GB) ≈ 287s。优化策略：
+#  首次加载后把不变量序列化为密集 numpy 数组存到 data/hex_cache.npz：
+#    - lon/lat 密集 2D 数组 (shape [NX, NZ], float32, NaN 标记缺失)
+#    - code 密集 2D 数组 (int32，供 road_sets 构建)
+#    - 仿射矩阵 M/T
+#  之后启动直接 np.load(npz)（~1s），不再碰 2.2GB pkl。
+#
+# 查表用密集数组下标 (x, z+Z_OFFSET)，O(1)，无需重建 dict。
 # ============================================================
 import pickle as _pickle
 
-_HEX_ORIGIN = None          # (origin_x, origin_y) in EPSG:2434
+_HEX_ORIGIN = None          # 兼容旧引用（= _HEX_AFFINE_T）
 _HEX_SIDE = 200.0
 _SQRT3 = np.sqrt(3)
+_HEX_GRID = None           # HexGridProxy（供 load_hex_mapdata 返回）
+# 密集数组（懒加载）：用 (x, z + Z_OFFSET) 下标取值，NaN 表示无 cell
+_HEX_LON = None            # 2D float32 [NX, NZ]
+_HEX_LAT = None            # 2D float32 [NX, NZ]
+_HEX_CODE = None           # 2D int32  [NX, NZ]（道路位掩码，供 road_sets）
+_HEX_X_OFFSET = 0          # x - _HEX_X_OFFSET 即数组第一维下标
+_HEX_Z_OFFSET = 0          # z - _HEX_Z_OFFSET 即数组第二维下标
+_HEX_N_CELLS = 0           # 有效 cell 数（len）
+_HEX_AFFINE_M = None        # 2x2: (x, z) -> (px, py) in EPSG:2434
+_HEX_AFFINE_T = None        # (tx, ty) 平移
+_HEX_AFFINE_MINV = None     # M 的逆
+_HEX_PKL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                             "data", "hex_grid_2025.pkl")
+_HEX_CACHE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                               "data", "hex_cache.npz")
 
 
-def _init_hex_origin(pkl_path=None):
-    """懒加载六边形网格原点 (0,0,0) 对应的 EPSG:2434 投影坐标"""
-    global _HEX_ORIGIN
-    if _HEX_ORIGIN is not None:
-        return _HEX_ORIGIN
-    if pkl_path is None:
-        pkl_path = os.path.join(os.path.dirname(os.path.dirname(__file__)),
-                                "data", "hex_grid.pkl")
+class HexGridProxy:
+    """轻量网格代理，模拟 dict 的 __contains__/__len__/__getitem__。
+
+    背后是密集数组（_HEX_LON/_HEX_LAT/_HEX_CODE），不存 640 万 dict。
+    用于 LabelPath 的 hex_in_map / 道路叠加层存在性判断。
+    """
+
+    def __contains__(self, key):
+        try:
+            x, y, z = int(key[0]), int(key[1]), int(key[2])
+        except (TypeError, IndexError):
+            return False
+        ix = x - _HEX_X_OFFSET
+        iz = z - _HEX_Z_OFFSET
+        if not (0 <= ix < _HEX_LON.shape[0] and 0 <= iz < _HEX_LON.shape[1]):
+            return False
+        return not np.isnan(_HEX_LON[ix, iz])
+
+    def __len__(self):
+        return _HEX_N_CELLS
+
+    def __getitem__(self, key):
+        ix = int(key[0]) - _HEX_X_OFFSET
+        iz = int(key[2]) - _HEX_Z_OFFSET
+        if not (0 <= ix < _HEX_LON.shape[0] and 0 <= iz < _HEX_LON.shape[1]):
+            raise KeyError(key)
+        lon = _HEX_LON[ix, iz]
+        if np.isnan(lon):
+            raise KeyError(key)
+        return {"lon": float(lon), "lat": float(_HEX_LAT[ix, iz]),
+                "code": int(_HEX_CODE[ix, iz])}
+
+    def items(self):
+        """遍历所有有效 cell（供 hex_mapdata_to_road_sets 等使用）。
+
+        仅在缓存缺失、需重建 road_sets 时调用；正常路径用缓存避免此遍历。
+        """
+        NX, NZ = _HEX_LON.shape
+        for ix in range(NX):
+            lon_row = _HEX_LON[ix]
+            lat_row = _HEX_LAT[ix]
+            code_row = _HEX_CODE[ix]
+            x = ix + _HEX_X_OFFSET
+            for iz in range(NZ):
+                lon = lon_row[iz]
+                if np.isnan(lon):
+                    continue
+                z = iz + _HEX_Z_OFFSET
+                yield ((x, -x - z, z),
+                       {"lon": float(lon), "lat": float(lat_row[iz]),
+                        "code": int(code_row[iz])})
+
+
+def _fit_affine_from_arrays():
+    """从已加载的密集数组采样拟合仿射 (x,z)→EPSG:2434。"""
+    global _HEX_AFFINE_M, _HEX_AFFINE_T, _HEX_AFFINE_MINV
+    NX, NZ = _HEX_LON.shape
+    # 等距采样 ~20000 个有效点
+    valid_mask = ~np.isnan(_HEX_LON)
+    total_valid = int(valid_mask.sum())
+    step = max(1, total_valid // 20000)
+    xs_idx, zs_idx = np.nonzero(valid_mask)
+    xs_idx = xs_idx[::step]
+    zs_idx = zs_idx[::step]
+    lons = _HEX_LON[xs_idx, zs_idx]
+    lats = _HEX_LAT[xs_idx, zs_idx]
+    xs = xs_idx.astype(float) + _HEX_X_OFFSET
+    zs = zs_idx.astype(float) + _HEX_Z_OFFSET
+    px, py = _wgs84_to_bj.transform(lons, lats)
+    A = np.column_stack([xs, zs, np.ones_like(xs)])
+    cx, *_ = np.linalg.lstsq(A, px, rcond=None)
+    cy, *_ = np.linalg.lstsq(A, py, rcond=None)
+    _HEX_AFFINE_M = np.array([[cx[0], cx[1]], [cy[0], cy[1]]])
+    _HEX_AFFINE_T = np.array([cx[2], cy[2]])
+    _HEX_AFFINE_MINV = np.linalg.inv(_HEX_AFFINE_M)
+
+
+def _build_cache_from_pkl(pkl_path):
+    """从 2.2GB pkl 构建密集数组缓存并保存到 data/hex_cache.npz。"""
+    global _HEX_ORIGIN, _HEX_GRID, _HEX_LON, _HEX_LAT, _HEX_CODE
+    global _HEX_X_OFFSET, _HEX_Z_OFFSET, _HEX_N_CELLS
     with open(pkl_path, "rb") as f:
         hex_grid = _pickle.load(f)
-    origin_entry = hex_grid[(0, 0, 0)]
-    origin_x, origin_y = _wgs84_to_bj.transform(origin_entry["lon"], origin_entry["lat"])
-    _HEX_ORIGIN = (origin_x, origin_y)
+    if not hex_grid:
+        raise ValueError(f"hex_grid is empty in {pkl_path}")
+
+    # 求坐标范围 → 密集数组尺寸
+    xs = np.fromiter((k[0] for k in hex_grid.keys()), dtype=np.int32, count=len(hex_grid))
+    zs = np.fromiter((k[2] for k in hex_grid.keys()), dtype=np.int32, count=len(hex_grid))
+    x_min, x_max = int(xs.min()), int(xs.max())
+    z_min, z_max = int(zs.min()), int(zs.max())
+    NX = x_max - x_min + 1
+    NZ = z_max - z_min + 1
+    _HEX_X_OFFSET = x_min
+    _HEX_Z_OFFSET = z_min
+    _HEX_N_CELLS = len(hex_grid)
+
+    lon = np.full((NX, NZ), np.nan, dtype=np.float32)
+    lat = np.full((NX, NZ), np.nan, dtype=np.float32)
+    code = np.zeros((NX, NZ), dtype=np.int32)
+    for (x, y, z), v in hex_grid.items():
+        ix = x - x_min
+        iz = z - z_min
+        lon[ix, iz] = v["lon"]
+        lat[ix, iz] = v["lat"]
+        code[ix, iz] = int(v.get("code", 0) or 0)
+    _HEX_LON, _HEX_LAT, _HEX_CODE = lon, lat, code
+
+    _fit_affine_from_arrays()
+    _HEX_ORIGIN = (float(_HEX_AFFINE_T[0]), float(_HEX_AFFINE_T[1]))
+
+    np.savez(_HEX_CACHE_PATH,
+             lon=lon, lat=lat, code=code,
+             x_offset=np.int32(x_min), z_offset=np.int32(z_min),
+             n_cells=np.int64(_HEX_N_CELLS),
+             affine_M=_HEX_AFFINE_M, affine_T=_HEX_AFFINE_T)
+    _HEX_GRID = HexGridProxy()
+    del hex_grid  # 释放原始 dict 内存
     return _HEX_ORIGIN
 
 
+def _load_from_cache():
+    """从 data/hex_cache.npz 加载密集数组（快路径，~1s）。"""
+    global _HEX_ORIGIN, _HEX_GRID, _HEX_LON, _HEX_LAT, _HEX_CODE
+    global _HEX_X_OFFSET, _HEX_Z_OFFSET, _HEX_N_CELLS
+    global _HEX_AFFINE_M, _HEX_AFFINE_T, _HEX_AFFINE_MINV
+    d = np.load(_HEX_CACHE_PATH)
+    _HEX_LON = d["lon"]
+    _HEX_LAT = d["lat"]
+    _HEX_CODE = d["code"]
+    _HEX_X_OFFSET = int(d["x_offset"])
+    _HEX_Z_OFFSET = int(d["z_offset"])
+    _HEX_N_CELLS = int(d["n_cells"])
+    _HEX_AFFINE_M = d["affine_M"]
+    _HEX_AFFINE_T = d["affine_T"]
+    _HEX_AFFINE_MINV = np.linalg.inv(_HEX_AFFINE_M)
+    _HEX_ORIGIN = (float(_HEX_AFFINE_T[0]), float(_HEX_AFFINE_T[1]))
+    _HEX_GRID = HexGridProxy()
+
+
+def _init_hex_origin(pkl_path=None):
+    """初始化网格：优先读缓存(npz)，无缓存则读 pkl 并构建缓存。"""
+    global _HEX_ORIGIN
+    if _HEX_LON is not None:
+        return _HEX_ORIGIN
+    if os.path.exists(_HEX_CACHE_PATH):
+        _load_from_cache()
+        return _HEX_ORIGIN
+    if pkl_path is None:
+        pkl_path = _HEX_PKL_PATH
+    return _build_cache_from_pkl(pkl_path)
+
+
+def get_hex_grid(pkl_path=None):
+    """触发网格加载（优先缓存）并返回 HexGridProxy（避免重复读取 2.2GB）。"""
+    if _HEX_LON is None:
+        _init_hex_origin(pkl_path)
+    return _HEX_GRID
+
+
+def rebuild_hex_cache(pkl_path=None):
+    """强制从 pkl 重建 data/hex_cache.npz（数据更新后调用）。"""
+    if pkl_path is None:
+        pkl_path = _HEX_PKL_PATH
+    # 重置全局状态，强制重建
+    import sys as _sys
+    mod = _sys.modules[__name__]
+    for attr in ("_HEX_LON", "_HEX_LAT", "_HEX_CODE", "_HEX_GRID",
+                 "_HEX_AFFINE_M", "_HEX_AFFINE_T", "_HEX_AFFINE_MINV",
+                 "_HEX_ORIGIN"):
+        setattr(mod, attr, None)
+    return _build_cache_from_pkl(pkl_path)
+
+
+def _affine_xyz_to_lonlat(x, y, z):
+    """仿射回退：(x, y, z) -> (lon, lat)。y 不参与（= -x-z）。"""
+    xa = np.asarray(x, dtype=float)
+    za = np.asarray(z, dtype=float)
+    px = _HEX_AFFINE_M[0, 0] * xa + _HEX_AFFINE_M[0, 1] * za + _HEX_AFFINE_T[0]
+    py = _HEX_AFFINE_M[1, 0] * xa + _HEX_AFFINE_M[1, 1] * za + _HEX_AFFINE_T[1]
+    return _bj_to_wgs84.transform(px, py)
+
+
 def wgs84_to_hex(lon, lat):
-    """WGS84 经纬度 → 平顶六边形立方体坐标 (x, y, z)"""
-    origin_x, origin_y = _init_hex_origin()
-    px, py = _wgs84_to_bj.transform(np.asarray(lon), np.asarray(lat))
-    cx = px - origin_x
-    cy = py - origin_y
+    """WGS84 经纬度 → 平顶六边形立方体坐标 (x, y, z)。
 
-    q = (cx * 2.0 / 3.0) / _HEX_SIDE
-    r = (-cx / 3.0 + _SQRT3 / 3.0 * cy) / _HEX_SIDE
+    仿射反算初值 + 邻域搜索最近 cell。支持标量与数组。
+    """
+    if _HEX_LON is None:
+        _init_hex_origin()
+    la = np.asarray(lon)
+    if la.ndim == 0:
+        return _nearest_hex_key(float(lon), float(lat))
+    la2 = np.asarray(lat)
+    n = la.shape[0]
+    xs, ys, zs = [0] * n, [0] * n, [0] * n
+    for i in range(n):
+        k = _nearest_hex_key(float(la[i]), float(la2[i]))
+        xs[i], ys[i], zs[i] = k[0], k[1], k[2]
+    return xs, ys, zs
 
-    s = -q - r
-    qi = np.round(q).astype(int)
-    ri = np.round(r).astype(int)
-    si = np.round(s).astype(int)
 
-    qd = np.abs(qi - q)
-    rd = np.abs(ri - r)
-    sd = np.abs(si - s)
+def _nearest_hex_key(lon, lat):
+    """标量 (lon, lat) -> 最近实际 cell key (x, y, z)。仿射初值 + 邻域搜索。
 
-    # 修正舍入误差最大的分量，确保 x+y+z=0
-    fix_q = (qd > rd) & (qd > sd)
-    fix_r = (rd > sd) & ~fix_q
-    fix_s = ~(fix_q | fix_r)
-
-    if np.ndim(lon) == 0:
-        if fix_q:
-            qi = -ri - si
-        elif fix_r:
-            ri = -qi - si
-        else:
-            si = -qi - ri
-        return (int(qi), int(si), int(ri))
-    else:
-        qi = np.where(fix_q, -ri - si, qi)
-        ri = np.where(fix_r, -qi - si, ri)
-        si = np.where(fix_s, -qi - ri, si)
-        return (qi, si, ri)
+    注：全国 pkl 范围大，纯仿射初值最大偏差约 9.5 cell，故邻域搜索半径
+    取 ±12 以保证覆盖。
+    """
+    pxb, pyb = _wgs84_to_bj.transform(np.asarray(lon, dtype=float),
+                                      np.asarray(lat, dtype=float))
+    d = np.array([float(pxb) - _HEX_AFFINE_T[0], float(pyb) - _HEX_AFFINE_T[1]])
+    xz = _HEX_AFFINE_MINV @ d
+    xi = int(round(xz[0]))
+    zi = int(round(xz[1]))
+    best, bestd = None, float("inf")
+    for ddx in range(-12, 13):
+        for ddz in range(-12, 13):
+            kx, kz = xi + ddx, zi + ddz
+            ix = kx - _HEX_X_OFFSET
+            iz = kz - _HEX_Z_OFFSET
+            if not (0 <= ix < _HEX_LON.shape[0] and 0 <= iz < _HEX_LON.shape[1]):
+                continue
+            clo = _HEX_LON[ix, iz]
+            if np.isnan(clo):
+                continue
+            cla = _HEX_LAT[ix, iz]
+            dd = (clo - lon) ** 2 + (cla - lat) ** 2
+            if dd < bestd:
+                bestd = dd
+                best = (kx, -kx - kz, kz)
+    if best is not None:
+        return best
+    return (xi, -xi - zi, zi)
 
 
 def hex_to_wgs84(x, y, z):
-    """六边形立方体坐标 (x, y, z) → WGS84 (lon, lat)"""
-    origin_x, origin_y = _init_hex_origin()
-    x_arr = np.asarray(x, dtype=np.float64)
-    z_arr = np.asarray(z, dtype=np.float64)
+    """六边形立方体坐标 (x, y, z) → WGS84 (lon, lat)。
 
-    q = x_arr
-    r = z_arr
-    cx = q * _HEX_SIDE * 1.5
-    cy = _SQRT3 * _HEX_SIDE * (r + q / 2.0)
-    px = cx + origin_x
-    py = cy + origin_y
-    lon, lat = _bj_to_wgs84.transform(px, py)
+    优先查密集数组（精确）；越界缺失用仿射回退。支持标量与数组。
+    """
+    if _HEX_LON is None:
+        _init_hex_origin()
+    xa = np.asarray(x)
+    if xa.ndim == 0:
+        ix = int(x) - _HEX_X_OFFSET
+        iz = int(z) - _HEX_Z_OFFSET
+        if 0 <= ix < _HEX_LON.shape[0] and 0 <= iz < _HEX_LON.shape[1]:
+            clo = _HEX_LON[ix, iz]
+            if not np.isnan(clo):
+                return float(clo), float(_HEX_LAT[ix, iz])
+        lon, lat = _affine_xyz_to_lonlat(x, y, z)
+        return float(lon), float(lat)
+    n = xa.shape[0]
+    yi = np.asarray(y)
+    zi = np.asarray(z)
+    lon = np.empty(n, dtype=float)
+    lat = np.empty(n, dtype=float)
+    for i in range(n):
+        ix = int(xa[i]) - _HEX_X_OFFSET
+        iz = int(zi[i]) - _HEX_Z_OFFSET
+        if 0 <= ix < _HEX_LON.shape[0] and 0 <= iz < _HEX_LON.shape[1]:
+            clo = _HEX_LON[ix, iz]
+            if not np.isnan(clo):
+                lon[i] = clo
+                lat[i] = _HEX_LAT[ix, iz]
+                continue
+        clo, cla = _affine_xyz_to_lonlat(xa[i], yi[i], zi[i])
+        lon[i] = clo
+        lat[i] = cla
     return lon, lat
 
 
@@ -218,7 +445,7 @@ def hex_distance(a, b):
 
 
 def hex_in_map(x, y, z, hex_grid):
-    """检查 (x,y,z) 是否在 hex_grid 字典范围内"""
+    """检查 (x,y,z) 是否在网格范围内。支持 HexGridProxy 与旧式 dict。"""
     return (int(x), int(y), int(z)) in hex_grid
 
 

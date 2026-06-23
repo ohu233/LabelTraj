@@ -12,7 +12,6 @@ Usage:
 import os
 import sys
 import json
-import pickle
 import argparse
 
 import numpy as np
@@ -34,6 +33,16 @@ matplotlib.rcParams["keymap.zoom"] = []
 matplotlib.rcParams["keymap.grid"] = []
 matplotlib.rcParams["keymap.xscale"] = []
 matplotlib.rcParams["keymap.yscale"] = []
+
+# 中文字体：图例/标题等含中文（如"高铁/铁路/国道..."），需指定支持中文的字体，
+# 否则显示为方框。优先用 Windows 自带的微软雅黑，缺失时回退 SimHei。
+_font_mgr = matplotlib.font_manager.fontManager
+_zh_fonts = ["Microsoft YaHei", "SimHei", "Microsoft JhengHei"]
+_available = {f.name for f in _font_mgr.ttflist}
+_zh_ok = [f for f in _zh_fonts if f in _available]
+if _zh_ok:
+    matplotlib.rcParams["font.sans-serif"] = _zh_ok + matplotlib.rcParams["font.sans-serif"]
+    matplotlib.rcParams["axes.unicode_minus"] = False  # 负号正常显示
 # ---------------------------------------------------------------------------
 from utils.geo_utils import (
     wgs84_to_hex,
@@ -42,14 +51,16 @@ from utils.geo_utils import (
     hex_distance,
     hex_in_map,
     _init_hex_origin,
+    get_hex_grid,
     mercator_wgs84_to_gcj02,
 )
 from utils.basemap import add_basemap, USE_BASEMAP
 
 from utils.tools import (
     hex_mapdata_to_road_sets,
-    build_multi_mapdata_hex,
     calculate_match_rate_hex,
+    MODE_LIST,
+    MODE_LABELS,
 )
 
 # ========================== Constants ==========================
@@ -65,10 +76,9 @@ HEX_DIRS = {
 }
 
 VIEW_PADDING_METERS = 10000  # hex 模式视口边距（Mercator 米）
-HEX_PKL_PATH = r"data\hex_grid.pkl"
+HEX_PKL_PATH = r"data\hex_grid_2025.pkl"
 
-MODE_LIST = ["GSD", "GG", "TS", "TG"]
-DEFAULT_CSV_PATH = r"data\dataset_multicity_with_hex_downsampled.csv"
+DEFAULT_CSV_PATH = r"data\dataset_multicity_with_hex_downsampled_2025.csv"
 DEFAULT_OUTPUT_DIR = "label_output"
 
 DISTANCE_THRESHOLD = 1.0
@@ -77,14 +87,32 @@ DISTANCE_THRESHOLD = 1.0
 CONTEXT_NEIGHBORS = 7
 
 # Label options after saving (press 1-6 to select)
+# 与路网渲染分组一致：GT/TL/DT/GS/GSD/EJ；5=Mixed, 6=Other
 LABEL_OPTIONS = {
-    "1": "GSD",
-    "2": "GG",
-    "3": "TS",
-    "4": "TG",
-    "5": "Mixed",
-    "6": "Other",
+    "1": "GT",
+    "2": "TL",
+    "3": "DT",
+    "4": "GS",
+    "5": "GSD",
+    "6": "EJ",
+    "7": "Mixed",
+    "8": "Other",
 }
+
+# 路网渲染分组配色（RGB），legend 与 overlay 共用，保证图例与路网颜色一致
+MODE_COLORS = {
+    "GT":  (0.65, 0.00, 0.65),  # 高铁   紫
+    "TL":  (0.95, 0.45, 0.00),  # 铁路   橙
+    "DT":  (0.00, 0.45, 1.00),  # 地铁   蓝
+    "GS":  (1.00, 0.00, 0.00),  # 高速   红
+    "GSD": (0.00, 0.75, 0.00),  # 国/省/环 绿
+    "EJ":  (0.55, 0.35, 0.77),  # 二级道路 浅紫
+}
+
+
+def _label_prompt_str():
+    """由 LABEL_OPTIONS 生成标签选择提示文本，避免硬编码漂移。"""
+    return "  ".join(f"[{k}] {v}" for k, v in LABEL_OPTIONS.items())
 
 # ========================== Hex Key Bindings ==========================
 HEX_KEY_MAP = {
@@ -103,10 +131,11 @@ HEX_KEY_MAP = {
 # ========================== Data Loading ==========================
 
 def load_hex_mapdata(path=HEX_PKL_PATH):
-    """加载六边形网格 pkl，触发原点初始化"""
-    _init_hex_origin(path)
-    with open(path, "rb") as f:
-        return pickle.load(f)
+    """加载六边形网格 pkl，触发原点/查表/仿射初始化。
+
+    复用 geo_utils 内部已加载的 pkl，避免重复读取 2.2GB 文件。
+    """
+    return get_hex_grid(path)
 
 
 # 原始点级数据缓存，供速度分布图使用
@@ -250,12 +279,11 @@ class PathRenderer:
         self.ax.set_ylabel("Web Mercator Y (EPSG:3857)")
         self.ax.grid(False)
 
-        # ---- 出行模式颜色图例 ----
+        # ---- 出行模式颜色图例（路网渲染分组）----
         mode_handles = [
-            Line2D([0], [0], color="purple", lw=3, label="TG"),
-            Line2D([0], [0], color="blue", lw=3, label="GG"),
-            Line2D([0], [0], color="green", lw=3, label="GSD"),
-            Line2D([0], [0], color="red", lw=3, label="TS"),
+            Line2D([0], [0], color=MODE_COLORS[m], lw=3,
+                   label=f"{m} {MODE_LABELS.get(m, '')}")
+            for m in MODE_LIST
         ]
         self.ax.legend(
             handles=mode_handles, loc="lower right",
@@ -432,14 +460,7 @@ class PathRenderer:
         self.ax_hist.tick_params(labelsize=8)
 
     def _build_hex_road_overlay(self, hex_grid):
-        """六边形模式道路叠加层 —— 视口范围内的散点图"""
-        mode_rgb = {
-            "TG":  (0.65, 0.00, 0.65),
-            "GG":  (0.00, 0.45, 1.00),
-            "GSD": (0.00, 0.75, 0.00),
-            "TS":  (1.00, 0.00, 0.00),
-        }
-
+        """六边形模式道路叠加层 —— 视口范围内的散点图（按 6 分组配色）"""
         # 视口 Mercator 四角 → WGS84 → 近似 hex 坐标范围
         from utils.geo_utils import _merc_to_wgs84
         corners_mx = [self._mx_min, self._mx_max, self._mx_max, self._mx_min]
@@ -474,7 +495,7 @@ class PathRenderer:
                         my_list.append(my)
 
             if mx_list:
-                r, g, b = mode_rgb.get(mode_name, (0.5, 0.5, 0.5))
+                r, g, b = MODE_COLORS.get(mode_name, (0.5, 0.5, 0.5))
                 gx, gy = mercator_wgs84_to_gcj02(mx_list, my_list)
                 self.ax.scatter(
                     gx, gy,
@@ -543,7 +564,7 @@ class PathRenderer:
     def show_label_prompt(self):
         """Show the label selection prompt after Enter is pressed."""
         self.ax.set_title(
-            "SELECT LABEL:  [1] GSD  [2] GG  [3] TS  [4] TG  [5] Mixed  [6] Other",
+            "SELECT LABEL:  " + _label_prompt_str(),
             fontsize=12, fontfamily="monospace", color="darkblue",
         )
         self.fig.canvas.draw_idle()
@@ -586,7 +607,7 @@ class LabelController:
         if start_in_label_mode:
             self.selecting_label = True
             self.renderer.show_label_prompt()
-            print(f"  Select label: 1=GSD 2=GG 3=TS 4=TG 5=Mixed 6=Other")
+            print(f"  Select label: " + " ".join(f"{k}={v}" for k, v in LABEL_OPTIONS.items()))
             print(f"  (Backspace to re-edit path)")
 
     def on_key(self, event):
@@ -649,7 +670,7 @@ class LabelController:
         elif action == "save":
             self.selecting_label = True
             self.renderer.show_label_prompt()
-            print(f"  Select label: 1=GSD 2=GG 3=TS 4=TG 5=Mixed 6=Other")
+            print(f"  Select label: " + " ".join(f"{k}={v}" for k, v in LABEL_OPTIONS.items()))
             print(f"  (Backspace to cancel)")
 
     def _finalize(self, label):
@@ -782,13 +803,8 @@ def main():
     print(f"Total trajectories: {len(traj_df)}")
 
     def make_state(row):
-        mode = str(row.get("mode", "ALL")).strip()
-        if mode not in MODE_LIST:
-            mode = "ALL"
-        if mode == "ALL":
-            multi = set().union(*road_sets.values())
-        else:
-            multi = build_multi_mapdata_hex(road_sets, mode)
+        # 匹配率基于所有可见路网分组的并集（不再按行内 mode 过滤）
+        multi = set().union(*road_sets.values()) if road_sets else set()
         return LabelState(row, multi, hex_grid=raw_mapdata)
 
     output_dir = args.output
