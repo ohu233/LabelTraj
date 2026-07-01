@@ -87,26 +87,23 @@ DISTANCE_THRESHOLD = 1.0
 CONTEXT_NEIGHBORS = 7
 
 # Label options after saving (press 1-6 to select)
-# 与路网渲染分组一致：GT/TL/DT/GS/GSD/EJ；5=Mixed, 6=Other
+# 与路网渲染分组一致：TG/TS/DT/GG/GSD；6=Other
 LABEL_OPTIONS = {
-    "1": "GT",
-    "2": "TL",
+    "1": "TG",
+    "2": "TS",
     "3": "DT",
-    "4": "GS",
+    "4": "GG",
     "5": "GSD",
-    "6": "EJ",
-    "7": "Mixed",
-    "8": "Other",
+    "6": "Other",
 }
 
 # 路网渲染分组配色（RGB），legend 与 overlay 共用，保证图例与路网颜色一致
 MODE_COLORS = {
-    "GT":  (0.65, 0.00, 0.65),  # 高铁   紫
-    "TL":  (0.95, 0.45, 0.00),  # 铁路   橙
+    "TG":  (0.65, 0.00, 0.65),  # 高铁   紫
+    "TS":  (0.95, 0.45, 0.00),  # 铁路   橙
     "DT":  (0.00, 0.45, 1.00),  # 地铁   蓝
-    "GS":  (1.00, 0.00, 0.00),  # 高速   红
+    "GG":  (1.00, 0.00, 0.00),  # 高速   红
     "GSD": (0.00, 0.75, 0.00),  # 国/省/环 绿
-    "EJ":  (0.55, 0.35, 0.77),  # 二级道路 浅紫
 }
 
 

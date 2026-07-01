@@ -13,10 +13,10 @@ import numpy as np
 #   bit 6  环路       HL
 #   bit 7  省道       SD
 #   bit 8  国道       GD
-#   bit 9  高速       GS
+#   bit 9  高速       GG
 #   bit 10 地铁       DT
-#   bit 11 铁路       TL
-#   bit 12 高铁       GT
+#   bit 11 铁路       TS
+#   bit 12 高铁       TG
 # 路网判断一律用 code 的 bit，**禁止用 *Name 字段**。
 # ============================================================
 
@@ -31,15 +31,15 @@ ROAD_BITS = {
     "HL":  1 << 6,   # 环路
     "SD":  1 << 7,   # 省道
     "GD":  1 << 8,   # 国道
-    "GS":  1 << 9,   # 高速
+    "GG":  1 << 9,   # 高速
     "DT":  1 << 10,  # 地铁
-    "TL":  1 << 11,  # 铁路
-    "GT":  1 << 12,  # 高铁
+    "TS":  1 << 11,  # 铁路
+    "TG":  1 << 12,  # 高铁
 }
 
 # 中文标签（供图例 / 提示使用）
 ROAD_LABELS = {
-    "GT": "高铁", "TL": "铁路", "DT": "地铁", "GS": "高速",
+    "TG": "高铁", "TS": "铁路", "DT": "地铁", "GG": "高速",
     "GD": "国道", "SD": "省道", "HL": "环路",
     "L2": "二级道路", "L3": "三级道路", "L4": "四级道路",
     "QT": "其他道路", "ZJ": "在建", "SL": "水路",
@@ -48,35 +48,32 @@ ROAD_LABELS = {
 # ============================================================
 # 可视化分组：将细类合并为展示用的大类
 # ------------------------------------------------------------
-#   GT   = 高铁
-#   TL   = 铁路
+#   TG   = 高铁
+#   TS   = 铁路
 #   DT   = 地铁
-#   GS   = 高速
+#   GG   = 高速
 #   GSD  = 国道 + 省道 + 环路（合并）
-#   EJ   = 二级道路（L2）
-# 三级道路(L3) / 四级道路(L4) / 其他(QT) / 在建(ZJ) / 水路(SL)
+# 二级道路(L2) / 三级道路(L3) / 四级道路(L4) / 其他(QT) / 在建(ZJ) / 水路(SL)
 # 默认不渲染、不参与匹配。
 # ============================================================
-MODE_LIST = ["GT", "TL", "DT", "GS", "GSD", "EJ"]
+MODE_LIST = ["TG", "TS", "DT", "GG", "GSD"]
 
 # 每个 MODE 由哪些细类 bit 合并而成
 MODE_BITS = {
-    "GT":  ROAD_BITS["GT"],
-    "TL":  ROAD_BITS["TL"],
+    "TG":  ROAD_BITS["TG"],
+    "TS":  ROAD_BITS["TS"],
     "DT":  ROAD_BITS["DT"],
-    "GS":  ROAD_BITS["GS"],
+    "GG":  ROAD_BITS["GG"],
     "GSD": ROAD_BITS["GD"] | ROAD_BITS["SD"] | ROAD_BITS["HL"],
-    "EJ":  ROAD_BITS["L2"],
 }
 
 # MODE 的中文标签（合并类合并命名）
 MODE_LABELS = {
-    "GT":  "高铁",
-    "TL":  "铁路",
+    "TG":  "高铁",
+    "TS":  "铁路",
     "DT":  "地铁",
-    "GS":  "高速",
+    "GG":  "高速",
     "GSD": "国道/省道/环路",
-    "EJ":  "二级道路",
 }
 
 # 默认不参与路网渲染与匹配的细类
@@ -138,7 +135,7 @@ def build_multi_mapdata_hex(road_sets, selected_mode):
 
     Args:
         road_sets: hex_mapdata_to_road_sets() 的返回值
-        selected_mode: 字符串 "GT" 或列表 ["GT", "GS"]
+        selected_mode: 字符串 "TG" 或列表 ["TG", "GG"]
 
     Returns:
         set: 包含选中分组所有道路的六边形坐标集合
