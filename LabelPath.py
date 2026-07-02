@@ -59,8 +59,10 @@ from utils.basemap import add_basemap, USE_BASEMAP
 from utils.tools import (
     hex_mapdata_to_road_sets,
     calculate_match_rate_hex,
+    decode_road_code,
     MODE_LIST,
     MODE_LABELS,
+    ROAD_KEY_TO_MODE,
 )
 
 # ========================== Constants ==========================
@@ -137,6 +139,9 @@ def load_hex_mapdata(path=HEX_PKL_PATH):
 
 # 原始点级数据缓存，供速度分布图使用
 _RAW_POINT_DF = None
+
+# 不保存轨迹开关（运行时按 N 切换）：开启后保存时 traj(路径)留空，其余字段照常写入
+_NO_TRAJ_MODE = True
 
 
 def get_raw_point_df():
@@ -290,6 +295,7 @@ class PathRenderer:
         self._update_title()
         self._draw_legend_box()
         self._draw_segment_info()
+        self._init_cell_info()
         self.fig.tight_layout()
 
     # ======================== Hex View Init ========================
@@ -504,10 +510,11 @@ class PathRenderer:
         state = self.state
         match = state.current_match_rate()
         reached = "ARRIVED" if state.reached else "moving"
+        notraj = " | NO-TRAJ" if _NO_TRAJ_MODE else ""
         title = (
             f"Mode: {state.mode} | Steps: {state.step_count} | "
             f"Dist: {state.remaining_dist:.1f} | "
-            f"Match: {match:.2%} | {reached}"
+            f"Match: {match:.2%} | {reached}{notraj}"
         )
         self.ax.set_title(title, fontsize=11, fontfamily="monospace")
 
@@ -517,7 +524,8 @@ class PathRenderer:
             "  Arrow / QWEASD   move\n"
             "  Backspace        undo\n"
             "  R                reset\n"
-            "  Enter            save & label"
+            "  Enter            save & label\n"
+            "  N                toggle no-traj"
         )
         self.ax.text(
             0.02, 0.98, text,
@@ -558,6 +566,52 @@ class PathRenderer:
             bbox=dict(boxstyle="round", facecolor="lightcyan", alpha=0.9),
         )
 
+    def _init_cell_info(self):
+        """左下角：当前光标所在栅格的道路属性信息框（栅格可能复合多种道路）。"""
+        # 不用 monospace：Windows 等宽字体无中文字形，会显示为方框，
+        # 改用默认 sans-serif（已配置微软雅黑/SimHei）以正常显示中文。
+        self.cell_info_text = self.ax.text(
+            0.02, 0.02, "",
+            transform=self.ax.transAxes,
+            fontsize=8,
+            verticalalignment="bottom", horizontalalignment="left",
+            bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.92),
+            zorder=7,
+        )
+        self._update_cell_info()
+
+    def _update_cell_info(self):
+        """刷新当前光标所在栅格的道路属性（细类 + 所属可视化分组）。
+
+        一个栅格的 code 可能同时命中多种道路（如 高速+国道），叠加层只能
+        显示一种颜色，这里把完整属性列出来辅助判断标注标签。
+        """
+        cur = self.state.cur
+        try:
+            code = self.state.hex_grid[cur]["code"]
+        except (KeyError, IndexError, TypeError):
+            code = 0
+
+        hits = decode_road_code(code)
+        if not hits:
+            body = "  无道路"
+        else:
+            rendered, others = [], []
+            for key, label in hits:
+                mode = ROAD_KEY_TO_MODE.get(key)
+                if mode:
+                    rendered.append(f"[{mode}]{label}")
+                else:
+                    others.append(label)
+            lines = []
+            if rendered:
+                lines.append("  " + "  ".join(rendered))
+            if others:
+                lines.append("  另含: " + " ".join(others))
+            body = "\n".join(lines)
+
+        self.cell_info_text.set_text(f"当前栅格 {cur}:\n{body}")
+
     def show_label_prompt(self):
         """Show the label selection prompt after Enter is pressed."""
         self.ax.set_title(
@@ -580,6 +634,7 @@ class PathRenderer:
         cursor_mx, cursor_my = mercator_wgs84_to_gcj02(cursor_mx, cursor_my)
         self.cursor.set_offsets([[cursor_mx, cursor_my]])
         self._update_title()
+        self._update_cell_info()
         self.fig.canvas.draw_idle()
 
 
@@ -608,6 +663,7 @@ class LabelController:
             print(f"  (Backspace to re-edit path)")
 
     def on_key(self, event):
+        global _NO_TRAJ_MODE
         if event.key is None:
             return
 
@@ -636,6 +692,14 @@ class LabelController:
                 self.renderer._update_title()
                 self.renderer.fig.canvas.draw_idle()
                 print(f"  Label selection cancelled, back to path editing")
+            return
+
+        # N：切换"不保存轨迹"模式——开启后保存时 traj(路径)留空，其余字段照常
+        if key == "n":
+            _NO_TRAJ_MODE = not _NO_TRAJ_MODE
+            self.renderer._update_title()
+            self.renderer.fig.canvas.draw_idle()
+            print(f"  [no-traj mode: {'ON' if _NO_TRAJ_MODE else 'OFF'}]")
             return
 
         if key not in HEX_KEY_MAP:
@@ -695,7 +759,11 @@ class LabelController:
         record["success"] = 1 if state.reached else 0
         record["match"] = match_rate
         record["steps"] = state.step_count
-        record["traj"] = json.dumps(traj_list, ensure_ascii=False)
+        if _NO_TRAJ_MODE:
+            # 不保存轨迹模式：仅留空 traj，其余字段照常写入
+            record["traj"] = ""
+        else:
+            record["traj"] = json.dumps(traj_list, ensure_ascii=False)
         record["mode"] = label
 
         df_new = pd.DataFrame([record])
@@ -725,11 +793,12 @@ class LabelController:
         out_df = out_df[front_cols + other_cols]
         out_df.to_csv(csv_path, index=False, encoding="utf-8")
 
-        png_name = f"ep_{self.current_idx:04d}_order_{state.order}_{label}.png"
-        png_path = os.path.join(self.output_dir, png_name)
-        self.renderer.fig.savefig(png_path, bbox_inches="tight", dpi=150)
         print(f"  -> CSV: {csv_path}")
-        print(f"  -> PNG: {png_path}")
+        if not _NO_TRAJ_MODE:
+            png_name = f"ep_{self.current_idx:04d}_order_{state.order}_{label}.png"
+            png_path = os.path.join(self.output_dir, png_name)
+            self.renderer.fig.savefig(png_path, bbox_inches="tight", dpi=150)
+            print(f"  -> PNG: {png_path}")
 
 
 # ========================== Main Loop ==========================
@@ -757,7 +826,7 @@ def run_single(state, raw_mapdata, output_dir, batch_mode, idx,
         print(f"\n{'='*60}")
         print(f"#{idx}  order={state.order}  mode={state.mode}")
         print(f"Start: {state.start}  ->  End: {state.end}")
-        print(f"Keys: W/A/S/D/Q/E=move  Backspace=undo  R=reset  Enter=save & label")
+        print(f"Keys: W/A/S/D/Q/E=move  Backspace=undo  R=reset  Enter=save & label  N=no-traj")
         print(f"{'='*60}")
     else:
         print(f"\n#{idx}  order={state.order}  mode={state.mode}  [RE-LABEL]")
@@ -841,21 +910,35 @@ def main():
             print(f"\nAll {len(traj_df)} trajectories labeled!")
 
     else:
-        # Prompt user for starting index
+        # Prompt user for starting index or uid
         while True:
             try:
                 user_input = input(
-                    f"Enter starting index [0-{len(traj_df)-1}], or press Enter for 0: "
+                    f"Enter starting index [0-{len(traj_df)-1}], "
+                    f"or uid (e.g. u123), or press Enter for 0: "
                 ).strip()
                 if user_input == "":
                     start_idx = 0
-                else:
-                    start_idx = int(user_input)
+                    break
+                if user_input.lower().startswith("u"):
+                    # 按数据(uid)定位：跳到该 uid 的第一条记录
+                    uid_val = int(user_input[1:])
+                    if "uid" not in traj_df.columns:
+                        print(f"  Error: CSV has no uid column")
+                        continue
+                    matches = traj_df.index[traj_df["uid"] == uid_val].tolist()
+                    if not matches:
+                        print(f"  Error: uid {uid_val} not found")
+                        continue
+                    start_idx = int(matches[0])
+                    print(f"  uid {uid_val} -> index {start_idx}")
+                    break
+                start_idx = int(user_input)
                 if 0 <= start_idx < len(traj_df):
                     break
                 print(f"  Error: index out of range [0, {len(traj_df)-1}]")
             except ValueError:
-                print(f"  Error: please enter a valid integer")
+                print(f"  Error: please enter a valid integer (index or u<uid>)")
             except (EOFError, KeyboardInterrupt):
                 print("\nExiting.")
                 sys.exit(0)

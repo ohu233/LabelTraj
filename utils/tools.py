@@ -80,6 +80,29 @@ MODE_LABELS = {
 EXCLUDED_BITS = (ROAD_BITS["L3"] | ROAD_BITS["L4"] | ROAD_BITS["QT"]
                  | ROAD_BITS["ZJ"] | ROAD_BITS["SL"])
 
+# 细类代码 → 所属可视化分组（仅含被渲染的细类；未渲染细类不在其中）
+ROAD_KEY_TO_MODE = {
+    k: mode
+    for mode in MODE_LIST
+    for k, bit in ROAD_BITS.items()
+    if MODE_BITS[mode] & bit
+}
+
+
+def decode_road_code(code):
+    """解码 cell 的 code 位掩码，返回命中的道路细类 [(key, label)，按 bit 顺序]。
+
+    Args:
+        code: cell 的道路位掩码（int）
+
+    Returns:
+        list[tuple[str, str]]: 命中的 (细类代码, 中文名)，按 ROAD_BITS 定义顺序；
+        空列表表示无道路。
+    """
+    if not code:
+        return []
+    return [(k, ROAD_LABELS[k]) for k, bit in ROAD_BITS.items() if code & bit]
+
 
 def hex_mapdata_to_road_sets(hex_grid):
     """将 hex_grid 按 MODE 拆分为各分组的六边形坐标集合。
