@@ -80,7 +80,7 @@ HEX_DIRS = {
 VIEW_PADDING_METERS = 10000  # hex 模式视口边距（Mercator 米）
 HEX_PKL_PATH = r"data\hex_grid_2025.pkl"
 
-DEFAULT_CSV_PATH = r"data\dataset_multicity_with_hex_downsampled_2025.csv"
+DEFAULT_CSV_PATH = r"data\dataset_multicity_20230917_unpacked.csv"
 DEFAULT_OUTPUT_DIR = "label_output"
 
 DISTANCE_THRESHOLD = 1.0
@@ -157,6 +157,16 @@ def load_traj_csv_hex(path, sample_step=10):
     """
     global _RAW_POINT_DF
     df = pd.read_csv(path)
+    # 列名兼容: 不同数据集标识列命名不同，统一为 uid
+    if "traj_id" in df.columns and "uid" not in df.columns:
+        df = df.rename(columns={"traj_id": "uid"})
+    # stime 可能是日期字符串，统一转为整数时间戳
+    if "stime" in df.columns and df["stime"].dtype == object:
+        df["stime"] = pd.to_datetime(df["stime"]).astype("int64") // 10**9
+    # uid 统一为整数（traj_id 可能是 "20230917_0000"，需与 records 中 int(uid) 类型一致，
+    # 否则速度分布图按 uid 匹配时类型不一致导致取不到数据）
+    if "uid" in df.columns:
+        df["uid"] = df["uid"].astype(str).str.replace("_", "").astype("int64")
     # 检测格式: 有 hex_x/hex_y/hex_z 列 → 点序列格式
     if "hex_x" in df.columns and "uid" in df.columns:
         _RAW_POINT_DF = df  # 缓存原始数据
@@ -443,7 +453,10 @@ class PathRenderer:
         raw = get_raw_point_df()
         if raw is None or self.ax_hist is None:
             return
-        uid_data = raw[(raw["uid"] == state.uid) & (raw["attribution"] != "origin")]
+        uid_mask = raw["uid"] == state.uid
+        if "attribution" in raw.columns:
+            uid_mask &= raw["attribution"] != "origin"
+        uid_data = raw[uid_mask]
         velocities = uid_data["velocity"].dropna()
         velocities = velocities[velocities >= 0]
 
