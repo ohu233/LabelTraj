@@ -55,6 +55,15 @@ from utils.geo_utils import (
     mercator_wgs84_to_gcj02,
 )
 from utils.basemap import add_basemap, USE_BASEMAP
+from utils.osm_pois import (
+    CATEGORY_LABELS as POI_CATEGORY_LABELS,
+    CATEGORY_SUBWAY,
+    CATEGORY_TOLL,
+    CATEGORY_TRAIN,
+    DEFAULT_POI_PATH,
+    group_pois_by_hex,
+    load_osm_pois,
+)
 
 from utils.tools import (
     hex_mapdata_to_road_sets,
@@ -107,6 +116,20 @@ MODE_COLORS = {
     "GG":  (1.00, 0.00, 0.00),  # 高速   红
     "GSD": (0.00, 0.75, 0.00),  # 国/省/环 绿
 }
+
+# OSM 点位使用独立形状，避免与已有线状路网颜色混淆。
+POI_STYLES = {
+    CATEGORY_SUBWAY: {
+        "label": "地铁站", "marker": "o", "color": "#00a8ff", "size": 78,
+    },
+    CATEGORY_TRAIN: {
+        "label": "火车站", "marker": "^", "color": "#ff8c00", "size": 92,
+    },
+    CATEGORY_TOLL: {
+        "label": "高速收费站", "marker": "P", "color": "#c000ff", "size": 96,
+    },
+}
+POI_LABEL_LIMIT = 45
 
 
 def _label_prompt_str():
@@ -271,12 +294,16 @@ class PathRenderer:
     """Manages the matplotlib figure and incremental updates (hex)."""
 
     def __init__(self, state: LabelState, raw_mapdata, road_sets=None,
-                 traj_df=None, current_idx=None, output_dir=None):
+                 traj_df=None, current_idx=None, output_dir=None, pois=None):
         self.state = state
         self.road_sets = road_sets
         self.traj_df = traj_df
         self.current_idx = current_idx
         self.output_dir = output_dir
+        self.pois = pois or []
+        self.pois_by_hex = group_pois_by_hex(self.pois)
+        self._poi_scatter_meta = []
+        self._poi_hover = None
 
         # 左右分栏：左侧地图，右侧速度分布
         self.fig = plt.figure(figsize=(16, 9))
@@ -297,8 +324,18 @@ class PathRenderer:
                    label=f"{m} {MODE_LABELS.get(m, '')}")
             for m in MODE_LIST
         ]
+        poi_handles = [
+            Line2D(
+                [0], [0], linestyle="None", marker=style["marker"],
+                markerfacecolor=style["color"], markeredgecolor="white",
+                markeredgewidth=1.0, markersize=8,
+                label=style["label"],
+            )
+            for category, style in POI_STYLES.items()
+            if any(record["category"] == category for record in self.pois)
+        ]
         self.ax.legend(
-            handles=mode_handles, loc="lower right",
+            handles=mode_handles + poi_handles, loc="lower right",
             fontsize=7, handlelength=1.5, borderpad=0.4, labelspacing=0.3,
         )
 
@@ -348,6 +385,10 @@ class PathRenderer:
         # 道路叠加层：每个模式用散点图
         if self.road_sets is not None:
             self._build_hex_road_overlay(raw_mapdata)
+
+        # OSM POI 层：只从本地缓存读取，不在标注过程中发起网络请求。
+        if self.pois:
+            self._draw_osm_pois()
 
         # 起终点标记（GCJ-02 偏移）
         start_mx, start_my = mercator_wgs84_to_gcj02(start_mx, start_my)
@@ -519,6 +560,90 @@ class PathRenderer:
                     marker='h', zorder=2, label=mode_name,
                 )
 
+    def _draw_osm_pois(self):
+        """Draw cached OSM stations/toll points inside the current viewport."""
+        visible = [
+            record for record in self.pois
+            if self._mx_min <= record["_mercator_x"] <= self._mx_max
+            and self._my_min <= record["_mercator_y"] <= self._my_max
+        ]
+        if not visible:
+            return
+
+        for category, style in POI_STYLES.items():
+            category_records = [record for record in visible if record["category"] == category]
+            if not category_records:
+                continue
+            xs = [record["_display_x"] for record in category_records]
+            ys = [record["_display_y"] for record in category_records]
+            artist = self.ax.scatter(
+                xs, ys,
+                c=style["color"], marker=style["marker"], s=style["size"],
+                edgecolors="#202020", linewidths=1.2, alpha=1.0,
+                zorder=4.7, label=style["label"],
+            )
+            self._poi_scatter_meta.append((artist, category_records))
+
+        # Dense city-centre views remain readable: labels are shown directly
+        # only for a modest number of POIs; hover and cell info always work.
+        named_visible = [
+            record for record in visible
+            if record.get("name") and record.get("name") != "未命名"
+        ]
+        if len(named_visible) <= POI_LABEL_LIMIT:
+            labeled = set()
+            for record in named_visible:
+                label_key = (
+                    round(record["_display_x"], 1), round(record["_display_y"], 1),
+                    record.get("name", "未命名"),
+                )
+                if label_key in labeled:
+                    continue
+                labeled.add(label_key)
+                self.ax.annotate(
+                    record.get("name", "未命名"),
+                    (record["_display_x"], record["_display_y"]),
+                    xytext=(4, 4), textcoords="offset points",
+                    fontsize=7, fontweight="bold", color="#151515", zorder=4.8,
+                    bbox=dict(boxstyle="round,pad=0.14", facecolor="white", alpha=0.82,
+                              edgecolor="none"),
+                )
+
+        self._poi_hover = self.ax.annotate(
+            "", xy=(0, 0), xytext=(8, 8), textcoords="offset points",
+            fontsize=8, zorder=8,
+            bbox=dict(boxstyle="round", facecolor="white", edgecolor="#555555", alpha=0.95),
+        )
+        self._poi_hover.set_visible(False)
+        self.ax.text(
+            0.5, 0.005, "POI © OpenStreetMap contributors",
+            transform=self.ax.transAxes, horizontalalignment="center",
+            verticalalignment="bottom", fontsize=6, color="#555555", zorder=7,
+            bbox=dict(boxstyle="round,pad=0.12", facecolor="white", alpha=0.72,
+                      edgecolor="none"),
+        )
+        self.fig.canvas.mpl_connect("motion_notify_event", self._on_poi_hover)
+
+    def _on_poi_hover(self, event):
+        """Show category and OSM name when hovering over a POI marker."""
+        if self._poi_hover is None:
+            return
+        if event.inaxes is self.ax:
+            for artist, records in reversed(self._poi_scatter_meta):
+                contains, details = artist.contains(event)
+                indices = details.get("ind", []) if contains else []
+                if len(indices):
+                    record = records[int(indices[0])]
+                    self._poi_hover.xy = (record["_display_x"], record["_display_y"])
+                    category = POI_CATEGORY_LABELS.get(record["category"], record["category"])
+                    self._poi_hover.set_text(f"{category}: {record.get('name', '未命名')}")
+                    self._poi_hover.set_visible(True)
+                    self.fig.canvas.draw_idle()
+                    return
+        if self._poi_hover.get_visible():
+            self._poi_hover.set_visible(False)
+            self.fig.canvas.draw_idle()
+
     def _update_title(self):
         state = self.state
         match = state.current_match_rate()
@@ -622,6 +747,20 @@ class PathRenderer:
             if others:
                 lines.append("  另含: " + " ".join(others))
             body = "\n".join(lines)
+
+        poi_hits = self.pois_by_hex.get(cur, [])
+        if poi_hits:
+            poi_text = []
+            seen = set()
+            for record in poi_hits:
+                item = (
+                    POI_CATEGORY_LABELS.get(record["category"], record["category"]),
+                    record.get("name", "未命名"),
+                )
+                if item not in seen:
+                    seen.add(item)
+                    poi_text.append(f"[{item[0]}]{item[1]}")
+            body += "\n  地点: " + "  ".join(poi_text)
 
         self.cell_info_text.set_text(f"当前栅格 {cur}:\n{body}")
 
@@ -817,11 +956,11 @@ class LabelController:
 # ========================== Main Loop ==========================
 
 def run_single(state, raw_mapdata, output_dir, batch_mode, idx,
-               start_in_label_mode=False, road_sets=None, traj_df=None):
+               start_in_label_mode=False, road_sets=None, traj_df=None, pois=None):
     """Run labeling for one trajectory. Returns (next_idx, keep_going)."""
     renderer = PathRenderer(state, raw_mapdata, road_sets=road_sets,
                             traj_df=traj_df, current_idx=idx,
-                            output_dir=output_dir)
+                            output_dir=output_dir, pois=pois)
     controller = LabelController(
         state, renderer, output_dir, batch_mode, idx,
         start_in_label_mode=start_in_label_mode,
@@ -868,6 +1007,10 @@ def main():
                         help="path to hex grid pickle file")
     parser.add_argument("--sample-step", type=int, default=1,
                         help="sampling interval for point-sequence CSV (default: 1)")
+    parser.add_argument("--poi-data", type=str, default=DEFAULT_POI_PATH,
+                        help="offline OSM POI GeoJSON cache")
+    parser.add_argument("--no-pois", action="store_true",
+                        help="do not display OSM subway/train/toll POIs")
     args = parser.parse_args()
 
     print("Loading hex grid map data...")
@@ -880,6 +1023,20 @@ def main():
     print("Loading trajectory data...")
     traj_df = load_traj_csv_hex(args.csv, sample_step=args.sample_step)
     print(f"Total trajectories: {len(traj_df)}")
+    pois = []
+    if not args.no_pois:
+        try:
+            pois = load_osm_pois(args.poi_data, hex_grid=raw_mapdata)
+            if pois:
+                print(f"Loaded OSM POIs: {len(pois):,}")
+                for category, style in POI_STYLES.items():
+                    count = sum(record["category"] == category for record in pois)
+                    print(f"  {style['label']}: {count:,}")
+            else:
+                print(f"  [WARN] OSM POI cache not found or empty: {args.poi_data}")
+                print("         Run: python download_osm_pois.py")
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"  [WARN] Failed to load OSM POI cache: {exc}")
 
     def make_state(row):
         # 匹配率基于所有可见路网分组的并集（不再按行内 mode 过滤）
@@ -894,7 +1051,7 @@ def main():
             sys.exit(1)
         state = make_state(traj_df.iloc[args.index])
         run_single(state, raw_mapdata, output_dir, batch_mode=False,
-                   idx=args.index, road_sets=road_sets, traj_df=traj_df)
+                   idx=args.index, road_sets=road_sets, traj_df=traj_df, pois=pois)
 
     elif args.batch:
         idx = 0
@@ -903,6 +1060,7 @@ def main():
             next_idx, keep_going = run_single(
                 state, raw_mapdata, output_dir, batch_mode=True,
                 idx=idx, road_sets=road_sets, traj_df=traj_df,
+                pois=pois,
             )
             if not keep_going:
                 print(f"Labeling stopped, completed up to #{idx}")
@@ -914,7 +1072,7 @@ def main():
                 next_idx, keep_going = run_single(
                     state, raw_mapdata, output_dir, batch_mode=True,
                     idx=idx, road_sets=road_sets, traj_df=traj_df,
-                    start_in_label_mode=True,
+                    start_in_label_mode=True, pois=pois,
                 )
                 if not keep_going:
                     break
@@ -962,6 +1120,7 @@ def main():
             next_idx, keep_going = run_single(
                 state, raw_mapdata, output_dir, batch_mode=True,
                 idx=idx, road_sets=road_sets, traj_df=traj_df,
+                pois=pois,
             )
             if not keep_going:
                 print(f"Labeling stopped, completed up to #{idx}")
@@ -973,7 +1132,7 @@ def main():
                 next_idx, keep_going = run_single(
                     state, raw_mapdata, output_dir, batch_mode=True,
                     idx=idx, road_sets=road_sets, traj_df=traj_df,
-                    start_in_label_mode=True,
+                    start_in_label_mode=True, pois=pois,
                 )
                 if not keep_going:
                     break
