@@ -117,6 +117,17 @@ MODE_COLORS = {
     "GSD": (0.00, 0.75, 0.00),  # 国/省/环 绿
 }
 
+# 已标注参考点沿用路网配色；Other 没有对应路网，使用中性灰。
+LABELED_POINT_COLORS = {
+    **MODE_COLORS,
+    "Other": (0.38, 0.38, 0.38),
+}
+
+# 视觉层级：当前起终信令点最醒目，较远上下文与静态辅助层主动退后。
+ROAD_OVERLAY_ALPHA = 0.20
+POI_ALPHA = 0.42
+CONTEXT_ALPHA = 0.88
+
 # OSM 点位使用独立形状，避免与已有线状路网颜色混淆。
 POI_STYLES = {
     CATEGORY_SUBWAY: {
@@ -135,6 +146,47 @@ POI_LABEL_LIMIT = 45
 def _label_prompt_str():
     """由 LABEL_OPTIONS 生成标签选择提示文本，避免硬编码漂移。"""
     return "  ".join(f"[{k}] {v}" for k, v in LABEL_OPTIONS.items())
+
+
+def _annotation_key(row):
+    """Return the stable (uid, idx_o) key shared by source and label CSVs."""
+    try:
+        return int(row["uid"]), int(row["idx_o"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def _canonical_label_mode(value):
+    text = str(value).strip()
+    for mode in LABELED_POINT_COLORS:
+        if text.casefold() == mode.casefold():
+            return mode
+    return None
+
+
+def load_labeled_modes(output_dir):
+    """Load labels already saved by this annotation run for map feedback."""
+    csv_path = os.path.join(output_dir, "traj_labeled.csv")
+    if not os.path.exists(csv_path):
+        return {}
+    try:
+        labeled = pd.read_csv(csv_path, encoding="utf-8")
+    except (OSError, ValueError, pd.errors.ParserError) as exc:
+        print(f"  [WARN] Failed to load existing labels for map feedback: {exc}")
+        return {}
+
+    required = {"uid", "idx_o", "mode"}
+    if not required.issubset(labeled.columns):
+        print(f"  [WARN] Existing label CSV lacks columns: {sorted(required - set(labeled.columns))}")
+        return {}
+
+    result = {}
+    for _, row in labeled.iterrows():
+        key = _annotation_key(row)
+        mode = _canonical_label_mode(row["mode"])
+        if key is not None and mode is not None:
+            result[key] = mode
+    return result
 
 # ========================== Hex Key Bindings ==========================
 HEX_KEY_MAP = {
@@ -294,12 +346,14 @@ class PathRenderer:
     """Manages the matplotlib figure and incremental updates (hex)."""
 
     def __init__(self, state: LabelState, raw_mapdata, road_sets=None,
-                 traj_df=None, current_idx=None, output_dir=None, pois=None):
+                 traj_df=None, current_idx=None, output_dir=None, pois=None,
+                 labeled_modes=None):
         self.state = state
         self.road_sets = road_sets
         self.traj_df = traj_df
         self.current_idx = current_idx
         self.output_dir = output_dir
+        self.labeled_modes = labeled_modes if labeled_modes is not None else {}
         self.pois = pois or []
         self.pois_by_hex = group_pois_by_hex(self.pois)
         self._poi_scatter_meta = []
@@ -393,17 +447,26 @@ class PathRenderer:
         # 起终点标记（GCJ-02 偏移）
         start_mx, start_my = mercator_wgs84_to_gcj02(start_mx, start_my)
         end_mx, end_my = mercator_wgs84_to_gcj02(end_mx, end_my)
+        self.ax.scatter(
+            start_mx, start_my,
+            c="white", marker="o", s=92,
+            edgecolors="white", linewidths=1.5, alpha=0.88, zorder=7.8,
+        )
         self.start_handle = self.ax.scatter(
             start_mx, start_my,
-            c="limegreen", marker="o", s=20,
-            edgecolors="darkgreen", linewidths=1.2, zorder=5, label="Start",
+            c="#39d353", marker="o", s=58,
+            edgecolors="darkgreen", linewidths=1.4, zorder=8, label="Start",
+        )
+        self.ax.scatter(
+            end_mx, end_my,
+            c="white", marker="o", s=142,
+            edgecolors="white", linewidths=1.8, alpha=0.92, zorder=8.05,
         )
         self.end_handle = self.ax.scatter(
             end_mx, end_my,
-            c="red", marker="X", s=20,
-            edgecolors="darkred", linewidths=1.2, zorder=5, label="End",
+            c="#ff2538", marker="X", s=102,
+            edgecolors="#8b0015", linewidths=1.4, zorder=8.2, label="End",
         )
-
         (self.path_line,) = self.ax.plot(
             [], [], "-",
             color="crimson", linewidth=2.5, alpha=0.85, zorder=3, label="Path",
@@ -413,8 +476,8 @@ class PathRenderer:
         cursor_mx, cursor_my = mercator_wgs84_to_gcj02(cursor_mx, cursor_my)
         self.cursor = self.ax.scatter(
             cursor_mx, cursor_my,
-            c="cyan", marker="o", s=20,
-            edgecolors="darkblue", linewidths=1.5, zorder=6, label="Cursor",
+            c="cyan", marker="o", s=48,
+            edgecolors="darkblue", linewidths=1.8, zorder=8.3, label="Cursor",
         )
 
         # ---- 上下文参考点（前一段起点 / 后一段终点）----
@@ -428,8 +491,8 @@ class PathRenderer:
 
         OD 链按时间顺序排列：
           [前n起点, ..., 前1起点, 当前起点, 当前终点, 下1终点, ..., 下n终点]
-        - 前链：前段起点序列 + 当前起点 → 灰色虚线，橙色菱形标前段起点；
-        - 后链：当前终点 + 下1~下n终点 → 灰色虚线，天蓝色菱形标后段终点。
+        - 已标注参考段使用对应路网颜色，未标注前/后段分别使用黄/蓝色；
+        - 完整保留前后窗口内的参考点，便于判断轨迹走向。
         """
         if self.traj_df is None or self.current_idx is None:
             return
@@ -443,23 +506,27 @@ class PathRenderer:
             return (float(mx), float(my))
 
         # ---- 前段 OD 链（远→近）：[前n起点, ..., 前1起点, 当前起点] ----
-        front_xyz = [(int(state.start[0]), int(state.start[1]), int(state.start[2]))]
+        front_items = [(idx, (int(state.start[0]), int(state.start[1]), int(state.start[2])))]
         for i in range(idx - 1, max(idx - CONTEXT_NEIGHBORS - 1, -1), -1):
             row_i = traj_df.iloc[i]
             if int(row_i.get("uid", -1)) != state.uid:
                 break
-            front_xyz.insert(0, (int(row_i["x_o"]), int(row_i["y_o"]), int(row_i["z_o"])))
+            front_items.insert(0, (
+                i, (int(row_i["x_o"]), int(row_i["y_o"]), int(row_i["z_o"])),
+            ))
 
         # ---- 后段 OD 链：[当前终点, 下1终点, ..., 下n终点] ----
-        back_xyz = [(int(state.end[0]), int(state.end[1]), int(state.end[2]))]
+        back_items = [(idx, (int(state.end[0]), int(state.end[1]), int(state.end[2])))]
         for i in range(idx + 1, min(idx + CONTEXT_NEIGHBORS + 1, len(traj_df))):
             row_i = traj_df.iloc[i]
             if int(row_i.get("uid", -1)) != state.uid:
                 break
-            back_xyz.append((int(row_i["x_d"]), int(row_i["y_d"]), int(row_i["z_d"])))
+            back_items.append((
+                i, (int(row_i["x_d"]), int(row_i["y_d"]), int(row_i["z_d"])),
+            ))
 
-        front_chain = [_proj(p) for p in front_xyz]  # 末尾为当前起点
-        back_chain = [_proj(p) for p in back_xyz]     # 起点为当前终点
+        front_chain = [_proj(item[1]) for item in front_items]  # 末尾为当前起点
+        back_chain = [_proj(item[1]) for item in back_items]     # 起点为当前终点
 
         # ---- 灰色虚线顺序连接 ----
         for chain in (front_chain, back_chain):
@@ -468,25 +535,38 @@ class PathRenderer:
                 ys = [p[1] for p in chain]
                 self.ax.plot(
                     xs, ys, "--",
-                    color="dimgray", linewidth=1.2,
-                    alpha=0.7, zorder=3,
+                    color="dimgray", linewidth=1.0,
+                    alpha=0.58, zorder=5.6,
                 )
 
         # ---- 参考点（不含当前段起止点，它们由 start/end_handle 负责）----
-        prev_pts = front_chain[:-1]   # 前段起点（去掉当前起点）
-        next_pts = back_chain[1:]     # 后段终点（去掉当前终点）
+        prev_pts = list(zip(front_items[:-1], front_chain[:-1]))
+        next_pts = list(zip(back_items[1:], back_chain[1:]))
 
-        for px, py in prev_pts:
+        def _saved_color(row_idx, fallback):
+            row_i = traj_df.iloc[row_idx]
+            mode = self.labeled_modes.get(_annotation_key(row_i))
+            return LABELED_POINT_COLORS.get(mode, fallback)
+
+        for pos, ((row_idx, _), (px, py)) in enumerate(prev_pts):
+            is_near = pos == len(prev_pts) - 1
             self.ax.scatter(
                 [px], [py],
-                c="orange", marker="D", s=20,
-                edgecolors="darkorange", linewidths=1, zorder=4,
+                c=[_saved_color(row_idx, "#d8a24a")], marker="D",
+                s=42 if is_near else 28,
+                edgecolors="#7a4b00", linewidths=1.4 if is_near else 0.9,
+                alpha=CONTEXT_ALPHA,
+                zorder=7.2 if is_near else 6.6,
             )
-        for px, py in next_pts:
+        for pos, ((row_idx, _), (px, py)) in enumerate(next_pts):
+            is_near = pos == 0
             self.ax.scatter(
                 [px], [py],
-                c="deepskyblue", marker="D", s=20,
-                edgecolors="blue", linewidths=1, zorder=4,
+                c=[_saved_color(row_idx, "deepskyblue")], marker="D",
+                s=46 if is_near else 28,
+                edgecolors="#005bbb", linewidths=1.6 if is_near else 0.9,
+                alpha=CONTEXT_ALPHA,
+                zorder=7.3 if is_near else 6.6,
             )
 
     def _draw_velocity_hist(self, state):
@@ -556,7 +636,7 @@ class PathRenderer:
                 gx, gy = mercator_wgs84_to_gcj02(mx_list, my_list)
                 self.ax.scatter(
                     gx, gy,
-                    c=[(r, g, b)], s=6, alpha=0.5,
+                    c=[(r, g, b)], s=6, alpha=ROAD_OVERLAY_ALPHA,
                     marker='h', zorder=2, label=mode_name,
                 )
 
@@ -579,8 +659,8 @@ class PathRenderer:
             artist = self.ax.scatter(
                 xs, ys,
                 c=style["color"], marker=style["marker"], s=style["size"],
-                edgecolors="#202020", linewidths=1.2, alpha=1.0,
-                zorder=4.7, label=style["label"],
+                edgecolors="#303030", linewidths=0.8, alpha=POI_ALPHA,
+                zorder=3.6, label=style["label"],
             )
             self._poi_scatter_meta.append((artist, category_records))
 
@@ -604,8 +684,8 @@ class PathRenderer:
                     record.get("name", "未命名"),
                     (record["_display_x"], record["_display_y"]),
                     xytext=(4, 4), textcoords="offset points",
-                    fontsize=7, fontweight="bold", color="#151515", zorder=4.8,
-                    bbox=dict(boxstyle="round,pad=0.14", facecolor="white", alpha=0.82,
+                    fontsize=6.5, fontweight="bold", color="#444444", zorder=3.7,
+                    bbox=dict(boxstyle="round,pad=0.14", facecolor="white", alpha=0.46,
                               edgecolor="none"),
                 )
 
@@ -689,9 +769,15 @@ class PathRenderer:
         time_str = _fmt(row.get("time_d", ""), ".0f")
 
         vel_str = _fmt(row.get("velocity_d", ""), ".2f")
+        uid_od_current, uid_od_total = self._uid_od_progress()
+        uid_od_str = (
+            f"{uid_od_current} / {uid_od_total}"
+            if uid_od_current is not None else "-"
+        )
 
         text = (
             "Segment Info:\n"
+            f"  UID OD:   {uid_od_str}\n"
             f"  dist:     {dist_str} m\n"
             f"  time:     {time_str} s\n"
             f"  velocity: {vel_str} km/h"
@@ -703,6 +789,22 @@ class PathRenderer:
             verticalalignment="top", horizontalalignment="right",
             bbox=dict(boxstyle="round", facecolor="lightcyan", alpha=0.9),
         )
+
+    def _uid_od_progress(self):
+        """Return the current OD's 1-based position and total within this UID."""
+        if self.traj_df is None or self.current_idx is None:
+            return None, None
+        if "uid" not in self.traj_df.columns:
+            return None, None
+        if not 0 <= self.current_idx < len(self.traj_df):
+            return None, None
+
+        uid_values = pd.to_numeric(self.traj_df["uid"], errors="coerce").to_numpy()
+        positions = np.flatnonzero(uid_values == self.state.uid)
+        current = np.flatnonzero(positions == self.current_idx)
+        if len(current) != 1:
+            return None, None
+        return int(current[0]) + 1, int(len(positions))
 
     def _init_cell_info(self):
         """左下角：当前光标所在栅格的道路属性信息框（栅格可能复合多种道路）。"""
@@ -918,6 +1020,11 @@ class LabelController:
             record["traj"] = json.dumps(traj_list, ensure_ascii=False)
         record["mode"] = label
 
+        key = _annotation_key(record)
+        canonical_mode = _canonical_label_mode(label)
+        if key is not None and canonical_mode is not None:
+            self.renderer.labeled_modes[key] = canonical_mode
+
         df_new = pd.DataFrame([record])
 
         # 读取已有标注，按 OD（uid + idx_o）去重后再追加，实现"覆盖"语义
@@ -956,11 +1063,13 @@ class LabelController:
 # ========================== Main Loop ==========================
 
 def run_single(state, raw_mapdata, output_dir, batch_mode, idx,
-               start_in_label_mode=False, road_sets=None, traj_df=None, pois=None):
+               start_in_label_mode=False, road_sets=None, traj_df=None, pois=None,
+               labeled_modes=None):
     """Run labeling for one trajectory. Returns (next_idx, keep_going)."""
     renderer = PathRenderer(state, raw_mapdata, road_sets=road_sets,
                             traj_df=traj_df, current_idx=idx,
-                            output_dir=output_dir, pois=pois)
+                            output_dir=output_dir, pois=pois,
+                            labeled_modes=labeled_modes)
     controller = LabelController(
         state, renderer, output_dir, batch_mode, idx,
         start_in_label_mode=start_in_label_mode,
@@ -1044,6 +1153,9 @@ def main():
         return LabelState(row, multi, hex_grid=raw_mapdata)
 
     output_dir = args.output
+    labeled_modes = load_labeled_modes(output_dir)
+    if labeled_modes:
+        print(f"Loaded existing labels for map feedback: {len(labeled_modes):,}")
 
     if args.index is not None:
         if args.index < 0 or args.index >= len(traj_df):
@@ -1051,7 +1163,8 @@ def main():
             sys.exit(1)
         state = make_state(traj_df.iloc[args.index])
         run_single(state, raw_mapdata, output_dir, batch_mode=False,
-                   idx=args.index, road_sets=road_sets, traj_df=traj_df, pois=pois)
+                   idx=args.index, road_sets=road_sets, traj_df=traj_df, pois=pois,
+                   labeled_modes=labeled_modes)
 
     elif args.batch:
         idx = 0
@@ -1060,7 +1173,7 @@ def main():
             next_idx, keep_going = run_single(
                 state, raw_mapdata, output_dir, batch_mode=True,
                 idx=idx, road_sets=road_sets, traj_df=traj_df,
-                pois=pois,
+                pois=pois, labeled_modes=labeled_modes,
             )
             if not keep_going:
                 print(f"Labeling stopped, completed up to #{idx}")
@@ -1073,6 +1186,7 @@ def main():
                     state, raw_mapdata, output_dir, batch_mode=True,
                     idx=idx, road_sets=road_sets, traj_df=traj_df,
                     start_in_label_mode=True, pois=pois,
+                    labeled_modes=labeled_modes,
                 )
                 if not keep_going:
                     break
@@ -1120,7 +1234,7 @@ def main():
             next_idx, keep_going = run_single(
                 state, raw_mapdata, output_dir, batch_mode=True,
                 idx=idx, road_sets=road_sets, traj_df=traj_df,
-                pois=pois,
+                pois=pois, labeled_modes=labeled_modes,
             )
             if not keep_going:
                 print(f"Labeling stopped, completed up to #{idx}")
@@ -1133,6 +1247,7 @@ def main():
                     state, raw_mapdata, output_dir, batch_mode=True,
                     idx=idx, road_sets=road_sets, traj_df=traj_df,
                     start_in_label_mode=True, pois=pois,
+                    labeled_modes=labeled_modes,
                 )
                 if not keep_going:
                     break
