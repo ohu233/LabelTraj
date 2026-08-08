@@ -20,6 +20,7 @@ import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from matplotlib.patches import FancyBboxPatch, Rectangle
 from matplotlib.widgets import Button
 
 # 禁用 matplotlib 默认快捷键，避免与标注操作冲突
@@ -126,6 +127,10 @@ LABELED_POINT_COLORS = {
 ROAD_OVERLAY_ALPHA = 0.20
 POI_ALPHA = 0.42
 CONTEXT_ALPHA = 0.88
+UID_LIST_VISIBLE_ROWS = 28
+UID_LIST_SCROLL_STEP = 5
+UID_NAV_VISIBLE_ROWS = 28
+UID_NAV_SCROLL_STEP = 5
 
 # OSM 点位使用独立形状，避免与已有线状路网颜色混淆。
 POI_STYLES = {
@@ -433,15 +438,30 @@ class PathRenderer:
         self.road_visibility = {mode: True for mode in MODE_LIST}
         self._road_artists = {}
         self._road_buttons = {}
+        self.segment_select_callback = None
+        self._uid_list_uid = None
+        self._uid_list_offset = 0
+        self._uid_list_hit_rows = []
+        self._uid_nav_offset = 0
+        self._uid_nav_hit_rows = []
         self._prepare_static_indexes()
 
-        # 左右分栏：左侧地图，右侧速度分布
-        self.fig = plt.figure(figsize=(16, 9))
-        gs = self.fig.add_gridspec(1, 2, width_ratios=[3, 1], wspace=0.02)
-        self.ax = self.fig.add_subplot(gs[0])
-        self.ax_hist = self.fig.add_subplot(gs[1])
+        # 五栏：UID 列表、当前 UID 的 OD 列表、地图、信息栏、速度分布。
+        self.fig = plt.figure(figsize=(18, 9))
+        gs = self.fig.add_gridspec(
+            1, 5, width_ratios=[0.64, 0.70, 3, 0.92, 1], wspace=0.025,
+        )
+        self.ax_uid_nav = self.fig.add_subplot(gs[0])
+        self.ax_uid_list = self.fig.add_subplot(gs[1])
+        self.ax = self.fig.add_subplot(gs[2])
+        self.ax_info = self.fig.add_subplot(gs[3])
+        self.ax_hist = self.fig.add_subplot(gs[4])
         self.fig.canvas.manager.set_window_title("LabelPath — Hex Grid")
         self.fig.canvas.mpl_connect("motion_notify_event", self._on_poi_hover)
+        self.fig.canvas.mpl_connect("scroll_event", self._on_uid_list_scroll)
+        self.fig.canvas.mpl_connect("scroll_event", self._on_uid_nav_scroll)
+        self.fig.canvas.mpl_connect("button_press_event", self._on_uid_list_click)
+        self.fig.canvas.mpl_connect("button_press_event", self._on_uid_nav_click)
         self.show_segment(state, current_idx, initial=True)
         self._init_road_toggle_buttons()
         # Reserve a clear band between the x-axis labels and the bottom controls.
@@ -488,8 +508,32 @@ class PathRenderer:
                 for uid, positions in grouped.indices.items()
                 if not pd.isna(uid)
             }
+            self._uid_nav_values = np.asarray(
+                tuple(self._uid_segment_positions.keys()), dtype=np.int64,
+            )
+            self._uid_nav_index = {
+                int(uid): index for index, uid in enumerate(self._uid_nav_values)
+            }
+            labeled_idx_o_by_uid = {}
+            for uid, idx_o in self.labeled_modes:
+                labeled_idx_o_by_uid.setdefault(int(uid), set()).add(int(idx_o))
+            self._uid_labeled_counts = {uid: 0 for uid in self._uid_segment_positions}
+            if "idx_o" in self.traj_df.columns:
+                for uid, labeled_idx_os in labeled_idx_o_by_uid.items():
+                    positions = self._uid_segment_positions.get(uid)
+                    if positions is None:
+                        continue
+                    idx_o_values = pd.to_numeric(
+                        self.traj_df.iloc[positions]["idx_o"], errors="coerce",
+                    ).to_numpy()
+                    self._uid_labeled_counts[uid] = int(
+                        np.isin(idx_o_values, tuple(labeled_idx_os)).sum()
+                    )
         else:
             self._uid_segment_positions = {}
+            self._uid_nav_values = np.empty(0, dtype=np.int64)
+            self._uid_nav_index = {}
+            self._uid_labeled_counts = {}
 
     def show_segment(self, state, current_idx, initial=False):
         """Render another OD in the existing figure instead of reopening it."""
@@ -499,11 +543,20 @@ class PathRenderer:
         self._poi_hover = None
         self._road_artists = {}
         self.ax.clear()
+        self._draw_uid_navigation_list(ensure_current=True)
+        self._draw_uid_segment_list(ensure_current=True)
 
         self._init_hex_view(state, self.raw_mapdata)
 
-        self.ax.set_xlabel("Web Mercator X (EPSG:3857)")
-        self.ax.set_ylabel("Web Mercator Y (EPSG:3857)")
+        # Coordinates are not needed during annotation; keep the map uncluttered.
+        self.ax.set_xlabel("")
+        self.ax.set_ylabel("")
+        self.ax.tick_params(
+            axis="both", which="both", left=False, bottom=False,
+            labelleft=False, labelbottom=False,
+        )
+        self.ax.xaxis.offsetText.set_visible(False)
+        self.ax.yaxis.offsetText.set_visible(False)
         self.ax.grid(False)
 
         # ---- 出行模式颜色图例（路网渲染分组）----
@@ -522,9 +575,14 @@ class PathRenderer:
             for category, style in POI_STYLES.items()
             if category in self._poi_index
         ]
-        self.ax.legend(
-            handles=mode_handles + poi_handles, loc="lower right",
-            fontsize=7, handlelength=1.5, borderpad=0.4, labelspacing=0.3,
+        self.ax_info.clear()
+        self.ax_info.axis("off")
+        self._init_info_panel()
+        self.ax_info.legend(
+            handles=mode_handles + poi_handles, loc="upper left",
+            bbox_to_anchor=(0.055, 0.272), borderaxespad=0.0,
+            fontsize=7.2, handlelength=1.5, borderpad=0.0,
+            labelspacing=0.35, frameon=False,
         )
 
         self._update_title()
@@ -538,6 +596,283 @@ class PathRenderer:
                 )
                 self.fig.tight_layout()
         self.fig.canvas.draw_idle()
+
+    def set_segment_select_callback(self, callback):
+        """Set the absolute-row navigation callback used by the UID list."""
+        self.segment_select_callback = callback
+
+    def set_labeled_mode(self, key, mode):
+        """Update one saved label and the UID completion counter."""
+        is_new = key not in self.labeled_modes
+        self.labeled_modes[key] = mode
+        if is_new and key[0] in self._uid_labeled_counts:
+            self._uid_labeled_counts[key[0]] += 1
+
+    def _draw_uid_navigation_list(self, ensure_current=False):
+        """Draw the scrollable all-UID navigation list at the far left."""
+        ax = self.ax_uid_nav
+        ax.clear()
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.axis("off")
+        self._uid_nav_hit_rows = []
+
+        uid_values = self._uid_nav_values
+        total = len(uid_values)
+        if not total:
+            ax.text(0.5, 0.5, "没有可用 UID", ha="center", va="center", fontsize=9)
+            return
+
+        current_local = self._uid_nav_index.get(int(self.state.uid), 0)
+        if ensure_current:
+            if current_local < self._uid_nav_offset:
+                self._uid_nav_offset = current_local
+            elif current_local >= self._uid_nav_offset + UID_NAV_VISIBLE_ROWS:
+                self._uid_nav_offset = current_local - UID_NAV_VISIBLE_ROWS + 1
+
+        max_offset = max(0, total - UID_NAV_VISIBLE_ROWS)
+        self._uid_nav_offset = min(max(0, self._uid_nav_offset), max_offset)
+        stop = min(total, self._uid_nav_offset + UID_NAV_VISIBLE_ROWS)
+
+        ax.text(
+            0.5, 0.975, f"UID 列表\n{current_local + 1} / {total}",
+            ha="center", va="top", fontsize=8.5, fontweight="bold",
+            transform=ax.transAxes,
+        )
+
+        top, bottom = 0.89, 0.055
+        row_height = (top - bottom) / UID_NAV_VISIBLE_ROWS
+        dot_xs, dot_ys = [], []
+        dot_facecolors, dot_edgecolors = [], []
+        for visible_row, local_index in enumerate(range(self._uid_nav_offset, stop)):
+            uid = int(uid_values[local_index])
+            y = top - (visible_row + 0.5) * row_height
+            is_current = uid == int(self.state.uid)
+            if is_current:
+                ax.add_patch(Rectangle(
+                    (0.02, y - row_height * 0.46), 0.93, row_height * 0.92,
+                    transform=ax.transAxes, facecolor="#e7f2ff",
+                    edgecolor="#4c91d9", linewidth=1.0, zorder=0,
+                ))
+
+            total_od = len(self._uid_segment_positions.get(uid, ()))
+            is_complete = total_od > 0 and self._uid_labeled_counts.get(uid, 0) >= total_od
+            dot_xs.append(0.10)
+            dot_ys.append(y)
+            dot_facecolors.append("#2ca02c" if is_complete else (1.0, 1.0, 1.0, 0.0))
+            dot_edgecolors.append("#1e6b1e" if is_complete else "#a5a5a5")
+            ax.text(
+                0.19, y, str(uid), ha="left", va="center", fontsize=7.1,
+                fontweight="bold" if is_current else "normal",
+                color="#005baa" if is_current else "#303030",
+                transform=ax.transAxes,
+            )
+            self._uid_nav_hit_rows.append((
+                y - row_height * 0.5, y + row_height * 0.5, uid,
+            ))
+
+        ax.scatter(
+            dot_xs, dot_ys, s=34, marker="o", facecolors=dot_facecolors,
+            edgecolors=dot_edgecolors, linewidths=0.8,
+            transform=ax.transAxes, zorder=2,
+        )
+
+        if total > UID_NAV_VISIBLE_ROWS:
+            track_y, track_height = bottom, top - bottom
+            thumb_height = track_height * UID_NAV_VISIBLE_ROWS / total
+            scroll_range = track_height - thumb_height
+            thumb_y = top - thumb_height - (
+                scroll_range * self._uid_nav_offset / max_offset if max_offset else 0
+            )
+            ax.add_patch(Rectangle(
+                (0.965, track_y), 0.012, track_height,
+                transform=ax.transAxes, facecolor="#e1e1e1", edgecolor="none",
+            ))
+            ax.add_patch(Rectangle(
+                (0.965, thumb_y), 0.012, thumb_height,
+                transform=ax.transAxes, facecolor="#7f7f7f", edgecolor="none",
+            ))
+
+    def _on_uid_nav_scroll(self, event):
+        if event.inaxes is not self.ax_uid_nav:
+            return
+        max_offset = max(0, len(self._uid_nav_values) - UID_NAV_VISIBLE_ROWS)
+        if max_offset <= 0:
+            return
+        direction = getattr(event, "step", 0)
+        if not direction:
+            direction = 1 if event.button == "up" else -1
+        delta = -UID_NAV_SCROLL_STEP if direction > 0 else UID_NAV_SCROLL_STEP
+        next_offset = min(max(0, self._uid_nav_offset + delta), max_offset)
+        if next_offset == self._uid_nav_offset:
+            return
+        self._uid_nav_offset = next_offset
+        self._draw_uid_navigation_list(ensure_current=False)
+        self.fig.canvas.draw_idle()
+
+    def _first_unlabeled_position(self, uid):
+        positions = self._uid_segment_positions.get(uid, np.empty(0, dtype=np.int32))
+        if not len(positions):
+            return None
+        for position in positions:
+            if _annotation_key(self.traj_df.iloc[int(position)]) not in self.labeled_modes:
+                return int(position)
+        return int(positions[0])
+
+    def _on_uid_nav_click(self, event):
+        if event.inaxes is not self.ax_uid_nav or event.ydata is None:
+            return
+        if event.button != 1:
+            return
+        for y_min, y_max, uid in self._uid_nav_hit_rows:
+            if y_min <= event.ydata <= y_max:
+                target = self._first_unlabeled_position(uid)
+                if target is not None and target != self.current_idx \
+                        and self.segment_select_callback is not None:
+                    self.segment_select_callback(target)
+                return
+
+    def _draw_uid_segment_list(self, ensure_current=False):
+        """Draw the scrollable OD list for the current UID."""
+        ax = self.ax_uid_list
+        ax.clear()
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.axis("off")
+        self._uid_list_hit_rows = []
+
+        positions = self._uid_segment_positions.get(
+            self.state.uid, np.empty(0, dtype=np.int32),
+        )
+        total = len(positions)
+        if not total:
+            ax.text(0.5, 0.5, "当前 UID\n没有可用 OD", ha="center", va="center", fontsize=9)
+            return
+
+        local_matches = np.flatnonzero(positions == self.current_idx)
+        current_local = int(local_matches[0]) if len(local_matches) else 0
+        if self._uid_list_uid != self.state.uid:
+            self._uid_list_uid = self.state.uid
+            self._uid_list_offset = max(0, current_local - UID_LIST_VISIBLE_ROWS // 2)
+        elif ensure_current:
+            if current_local < self._uid_list_offset:
+                self._uid_list_offset = current_local
+            elif current_local >= self._uid_list_offset + UID_LIST_VISIBLE_ROWS:
+                self._uid_list_offset = current_local - UID_LIST_VISIBLE_ROWS + 1
+
+        max_offset = max(0, total - UID_LIST_VISIBLE_ROWS)
+        self._uid_list_offset = min(max(0, self._uid_list_offset), max_offset)
+        stop = min(total, self._uid_list_offset + UID_LIST_VISIBLE_ROWS)
+
+        ax.text(
+            0.5, 0.975,
+            f"UID {self.state.uid}\nOD 列表  {current_local + 1} / {total}",
+            ha="center", va="top", fontsize=8.5, fontweight="bold",
+            transform=ax.transAxes,
+        )
+        top, bottom = 0.89, 0.055
+        row_height = (top - bottom) / UID_LIST_VISIBLE_ROWS
+        dot_xs, dot_ys = [], []
+        dot_sizes, dot_facecolors, dot_edgecolors = [], [], []
+        for visible_row, local_index in enumerate(range(self._uid_list_offset, stop)):
+            global_index = int(positions[local_index])
+            y = top - (visible_row + 0.5) * row_height
+            is_current = global_index == self.current_idx
+            if is_current:
+                ax.add_patch(Rectangle(
+                    (0.025, y - row_height * 0.46), 0.925, row_height * 0.92,
+                    transform=ax.transAxes, facecolor="#e7f2ff",
+                    edgecolor="#4c91d9", linewidth=1.0, zorder=0,
+                ))
+
+            row = self.traj_df.iloc[global_index]
+            mode = self.labeled_modes.get(_annotation_key(row))
+            dot_color = LABELED_POINT_COLORS.get(mode)
+            dot_xs.append(0.14)
+            dot_ys.append(y)
+            dot_sizes.append(38 if dot_color is not None else 31)
+            if dot_color is None:
+                dot_facecolors.append((1.0, 1.0, 1.0, 0.0))
+                dot_edgecolors.append("#a5a5a5")
+            else:
+                dot_facecolors.append((*dot_color, 1.0))
+                dot_edgecolors.append("#303030")
+
+            ax.text(
+                0.25, y, f"{local_index + 1:>4d}",
+                ha="left", va="center", fontsize=8,
+                fontweight="bold" if is_current else "normal",
+                color="#005baa" if is_current else "#303030",
+                transform=ax.transAxes,
+            )
+            if mode is not None:
+                ax.text(
+                    0.88, y, mode, ha="right", va="center", fontsize=6.8,
+                    color=dot_color, fontweight="bold", transform=ax.transAxes,
+                )
+            self._uid_list_hit_rows.append((
+                y - row_height * 0.5, y + row_height * 0.5, global_index,
+            ))
+
+        ax.scatter(
+            dot_xs, dot_ys, s=dot_sizes, marker="o",
+            facecolors=dot_facecolors, edgecolors=dot_edgecolors,
+            linewidths=0.75, transform=ax.transAxes, zorder=2,
+        )
+
+        if total > UID_LIST_VISIBLE_ROWS:
+            track_y, track_height = bottom, top - bottom
+            thumb_height = track_height * UID_LIST_VISIBLE_ROWS / total
+            scroll_range = track_height - thumb_height
+            thumb_y = top - thumb_height - (
+                scroll_range * self._uid_list_offset / max_offset if max_offset else 0
+            )
+            ax.add_patch(Rectangle(
+                (0.965, track_y), 0.012, track_height,
+                transform=ax.transAxes, facecolor="#e1e1e1", edgecolor="none",
+            ))
+            ax.add_patch(Rectangle(
+                (0.965, thumb_y), 0.012, thumb_height,
+                transform=ax.transAxes, facecolor="#7f7f7f", edgecolor="none",
+            ))
+
+    def refresh_uid_segment_list(self):
+        """Refresh UID completion and OD label colors without changing scroll."""
+        self._draw_uid_navigation_list(ensure_current=False)
+        self._draw_uid_segment_list(ensure_current=False)
+        self.fig.canvas.draw_idle()
+
+    def _on_uid_list_scroll(self, event):
+        if event.inaxes is not self.ax_uid_list:
+            return
+        positions = self._uid_segment_positions.get(
+            self.state.uid, np.empty(0, dtype=np.int32),
+        )
+        max_offset = max(0, len(positions) - UID_LIST_VISIBLE_ROWS)
+        if max_offset <= 0:
+            return
+
+        direction = getattr(event, "step", 0)
+        if not direction:
+            direction = 1 if event.button == "up" else -1
+        delta = -UID_LIST_SCROLL_STEP if direction > 0 else UID_LIST_SCROLL_STEP
+        next_offset = min(max(0, self._uid_list_offset + delta), max_offset)
+        if next_offset == self._uid_list_offset:
+            return
+        self._uid_list_offset = next_offset
+        self._draw_uid_segment_list(ensure_current=False)
+        self.fig.canvas.draw_idle()
+
+    def _on_uid_list_click(self, event):
+        if event.inaxes is not self.ax_uid_list or event.ydata is None:
+            return
+        if event.button != 1:
+            return
+        for y_min, y_max, target in self._uid_list_hit_rows:
+            if y_min <= event.ydata <= y_max:
+                if target != self.current_idx and self.segment_select_callback is not None:
+                    self.segment_select_callback(target)
+                return
 
     def _init_road_toggle_buttons(self):
         """Create persistent bottom buttons for the five road-network layers."""
@@ -816,7 +1151,7 @@ class PathRenderer:
                                  label=f'mean={mean_v:.1f}')
             self.ax_hist.legend(fontsize=7, loc="upper right")
         self.ax_hist.set_xlabel("Velocity", fontsize=9)
-        self.ax_hist.set_ylabel("Count", fontsize=9)
+        self.ax_hist.set_ylabel("")
         self.ax_hist.set_title(f"UID {state.uid}\nn={len(velocities)}", fontsize=10)
         self.ax_hist.tick_params(labelsize=8)
 
@@ -991,25 +1326,52 @@ class PathRenderer:
         )
         self.ax.set_title(title, fontsize=11, fontfamily="monospace")
 
+    def _init_info_panel(self):
+        """Create four equally sized and consistently styled information cards."""
+        card_x, card_width = 0.025, 0.95
+        card_specs = (
+            ("keys", 0.76, 0.22, "Keys"),
+            ("segment", 0.55, 0.19, "Segment Info"),
+            ("cell", 0.34, 0.19, "当前栅格"),
+            ("legend", 0.02, 0.30, "地图图例"),
+        )
+        self._info_cards = {}
+        self._info_titles = {}
+        for name, y, height, title in card_specs:
+            card = FancyBboxPatch(
+                (card_x, y), card_width, height,
+                boxstyle="round,pad=0.006,rounding_size=0.012",
+                transform=self.ax_info.transAxes,
+                facecolor="#f7f9fb", edgecolor="#7d8994",
+                linewidth=0.9, zorder=0,
+            )
+            self.ax_info.add_patch(card)
+            self._info_cards[name] = card
+            self._info_titles[name] = self.ax_info.text(
+                card_x + 0.03, y + height - 0.018, title,
+                transform=self.ax_info.transAxes,
+                ha="left", va="top", fontsize=7.8, fontweight="bold",
+                color="#34495e", zorder=2,
+            )
+
     def _draw_legend_box(self):
         text = (
-            "Keys:\n"
-            "  Arrow / QWEASD   move\n"
-            "  Backspace        undo\n"
-            "  R                reset\n"
-            "  Enter            save & label\n"
-            "  N                toggle no-traj"
+            "Arrow/QWEASD  move\n"
+            "Backspace     undo\n"
+            "R             reset\n"
+            "Enter         save + label\n"
+            "N             no-traj"
         )
-        self.ax.text(
-            0.02, 0.98, text,
-            transform=self.ax.transAxes,
-            fontsize=8, fontfamily="monospace",
+        self.ax_info.text(
+            0.055, 0.928, text,
+            transform=self.ax_info.transAxes,
+            fontsize=7.2, fontfamily="monospace",
             verticalalignment="top",
-            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.9),
+            color="#27313a", zorder=2,
         )
 
     def _draw_segment_info(self):
-        """在右上角显示当前段的 dist / time / velocity"""
+        """在右侧信息栏显示当前段的 dist / time / velocity。"""
         state = self.state
         row = state.row
 
@@ -1031,18 +1393,17 @@ class PathRenderer:
         )
 
         text = (
-            "Segment Info:\n"
-            f"  UID OD:   {uid_od_str}\n"
-            f"  dist:     {dist_str} m\n"
-            f"  time:     {time_str} s\n"
-            f"  velocity: {vel_str} km/h"
+            f"UID OD:   {uid_od_str}\n"
+            f"dist:     {dist_str} m\n"
+            f"time:     {time_str} s\n"
+            f"velocity: {vel_str} km/h"
         )
-        self.ax.text(
-            0.98, 0.98, text,
-            transform=self.ax.transAxes,
-            fontsize=8, fontfamily="monospace",
-            verticalalignment="top", horizontalalignment="right",
-            bbox=dict(boxstyle="round", facecolor="lightcyan", alpha=0.9),
+        self.ax_info.text(
+            0.055, 0.688, text,
+            transform=self.ax_info.transAxes,
+            fontsize=7.2, fontfamily="monospace",
+            verticalalignment="top", horizontalalignment="left",
+            color="#27313a", zorder=2,
         )
 
     def _uid_od_progress(self):
@@ -1068,15 +1429,14 @@ class PathRenderer:
         )
 
     def _init_cell_info(self):
-        """左下角：当前光标所在栅格的道路属性信息框（栅格可能复合多种道路）。"""
+        """右侧信息栏：当前光标所在栅格的完整道路属性。"""
         # 不用 monospace：Windows 等宽字体无中文字形，会显示为方框，
         # 改用默认 sans-serif（已配置微软雅黑/SimHei）以正常显示中文。
-        self.cell_info_text = self.ax.text(
-            0.02, 0.02, "",
-            transform=self.ax.transAxes,
-            fontsize=8,
-            verticalalignment="bottom", horizontalalignment="left",
-            bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.92),
+        self.cell_info_text = self.ax_info.text(
+            0.055, 0.478, "",
+            transform=self.ax_info.transAxes,
+            fontsize=7.2, color="#27313a",
+            verticalalignment="top", horizontalalignment="left",
             zorder=7,
         )
         self._update_cell_info()
@@ -1095,7 +1455,7 @@ class PathRenderer:
 
         hits = decode_road_code(code)
         if not hits:
-            body = "  无道路"
+            body = "无道路"
         else:
             rendered, others = [], []
             for key, label in hits:
@@ -1106,9 +1466,9 @@ class PathRenderer:
                     others.append(label)
             lines = []
             if rendered:
-                lines.append("  " + "  ".join(rendered))
+                lines.append("  ".join(rendered))
             if others:
-                lines.append("  另含: " + " ".join(others))
+                lines.append("另含: " + " ".join(others))
             body = "\n".join(lines)
 
         poi_hits = self.pois_by_hex.get(cur, [])
@@ -1123,9 +1483,10 @@ class PathRenderer:
                 if item not in seen:
                     seen.add(item)
                     poi_text.append(f"[{item[0]}]{item[1]}")
-            body += "\n  地点: " + "  ".join(poi_text)
+            body += "\n地点: " + "  ".join(poi_text)
 
-        self.cell_info_text.set_text(f"当前栅格 {cur}:\n{body}")
+        self._info_titles["cell"].set_text(f"当前栅格 {cur}")
+        self.cell_info_text.set_text(body)
 
     def show_label_prompt(self):
         """Show the label selection prompt after Enter is pressed."""
@@ -1304,7 +1665,7 @@ class LabelController:
         key = _annotation_key(record)
         canonical_mode = _canonical_label_mode(label)
         if key is not None and canonical_mode is not None:
-            self.renderer.labeled_modes[key] = canonical_mode
+            self.renderer.set_labeled_mode(key, canonical_mode)
 
         df_new = pd.DataFrame([record])
 
@@ -1332,6 +1693,7 @@ class LabelController:
         other_cols = [c for c in out_df.columns if c not in front_cols]
         out_df = out_df[front_cols + other_cols]
         out_df.to_csv(csv_path, index=False, encoding="utf-8")
+        self.renderer.refresh_uid_segment_list()
 
         print(f"  -> CSV: {csv_path}")
         if not _NO_TRAJ_MODE:
@@ -1356,11 +1718,23 @@ def run_single(state, raw_mapdata, output_dir, batch_mode, idx,
         start_in_label_mode=start_in_label_mode,
     )
 
+    def select_segment(target):
+        if traj_df is None or not 0 <= int(target) < len(traj_df):
+            return
+        next_state = LabelState(
+            traj_df.iloc[int(target)], state.multi_mapdata, hex_grid=raw_mapdata,
+        )
+        renderer.show_segment(next_state, int(target))
+        controller.set_segment(next_state, int(target))
+        _print_segment_status(int(target), next_state)
+
+    renderer.set_segment_select_callback(select_segment)
+
     renderer.fig.canvas.mpl_connect("key_press_event", controller.on_key)
 
     def on_close(event):
         if not controller.saved:
-            print(f"  [WARN] window closed, #{idx} not saved")
+            print(f"  [WARN] window closed, #{controller.current_idx} not saved")
 
     renderer.fig.canvas.mpl_connect("close_event", on_close)
 
@@ -1413,8 +1787,8 @@ def run_continuous(start_idx, make_state, raw_mapdata, output_dir,
         state, renderer, output_dir, batch_mode=True, current_idx=start_idx,
     )
 
-    def navigate(delta, start_in_label_mode=False):
-        target = controller.current_idx + int(delta)
+    def show_target(target, start_in_label_mode=False):
+        target = int(target)
         if target >= len(traj_df):
             controller.saved = True
             print(f"\nAll {len(traj_df)} trajectories labeled!")
@@ -1429,7 +1803,11 @@ def run_continuous(start_idx, make_state, raw_mapdata, output_dir,
         controller.set_segment(next_state, target, start_in_label_mode)
         _print_segment_status(target, next_state, relabel=start_in_label_mode)
 
+    def navigate(delta, start_in_label_mode=False):
+        show_target(controller.current_idx + int(delta), start_in_label_mode)
+
     controller.navigate_callback = navigate
+    renderer.set_segment_select_callback(show_target)
     renderer.fig.canvas.mpl_connect("key_press_event", controller.on_key)
 
     def on_close(event):

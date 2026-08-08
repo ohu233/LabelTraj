@@ -93,6 +93,7 @@ class LabelFeedbackTest(unittest.TestCase):
     def test_segment_info_shows_uid_od_progress(self):
         renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
         renderer.fig, renderer.ax = plt.subplots()
+        renderer.ax_info = renderer.ax
         renderer.state = mock.Mock(
             uid=7,
             row=pd.Series({"dist_d": 120.5, "time_d": 8, "velocity_d": 54.2}),
@@ -104,6 +105,25 @@ class LabelFeedbackTest(unittest.TestCase):
 
         self.assertEqual(renderer._uid_od_progress(), (2, 3))
         self.assertIn("UID OD:   2 / 3", renderer.ax.texts[-1].get_text())
+        plt.close(renderer.fig)
+
+    def test_right_info_cards_share_width_style_and_compact_spacing(self):
+        renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+        renderer.fig, renderer.ax_info = plt.subplots()
+
+        renderer._init_info_panel()
+
+        cards = list(renderer._info_cards.values())
+        self.assertEqual(len(cards), 4)
+        self.assertTrue(all(card.get_width() == cards[0].get_width() for card in cards))
+        self.assertTrue(all(card.get_facecolor() == cards[0].get_facecolor() for card in cards))
+        ordered = sorted(cards, key=lambda card: card.get_y())
+        gaps = [
+            ordered[index + 1].get_y()
+            - (ordered[index].get_y() + ordered[index].get_height())
+            for index in range(len(ordered) - 1)
+        ]
+        self.assertTrue(all(0.0 < gap <= 0.025 for gap in gaps))
         plt.close(renderer.fig)
 
     def test_road_buttons_toggle_layer_without_rescaling_and_persist_on_redraw(self):
@@ -140,6 +160,138 @@ class LabelFeedbackTest(unittest.TestCase):
 
         self.assertFalse(renderer._road_artists["TG"].get_visible())
         self.assertEqual((renderer.ax.get_xlim(), renderer.ax.get_ylim()), before)
+        plt.close(renderer.fig)
+
+    def test_uid_od_list_uses_saved_mode_colors_and_highlights_current_row(self):
+        traj_df = pd.DataFrame([
+            {"uid": 7, "idx_o": i, "x_o": i, "y_o": 0, "z_o": -i,
+             "x_d": i + 1, "y_d": 0, "z_d": -(i + 1)}
+            for i in range(8)
+        ])
+        renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+        renderer.fig, renderer.ax_uid_list = plt.subplots()
+        renderer.traj_df = traj_df
+        renderer.state = mock.Mock(uid=7)
+        renderer.current_idx = 3
+        renderer.labeled_modes = {(7, 1): "TG", (7, 5): "GG"}
+        renderer._uid_segment_positions = {7: np.arange(8, dtype=np.int32)}
+        renderer._uid_list_uid = None
+        renderer._uid_list_offset = 0
+        renderer._uid_list_hit_rows = []
+
+        renderer._draw_uid_segment_list(ensure_current=True)
+
+        rendered_colors = [
+            color[:3]
+            for collection in renderer.ax_uid_list.collections
+            for color in collection.get_facecolors()
+        ]
+        self.assertTrue(any(np.allclose(color, LabelPath.MODE_COLORS["TG"])
+                            for color in rendered_colors))
+        self.assertTrue(any(np.allclose(color, LabelPath.MODE_COLORS["GG"])
+                            for color in rendered_colors))
+        self.assertTrue(any(patch.get_edgecolor()[2] > 0.7
+                            for patch in renderer.ax_uid_list.patches))
+        self.assertEqual(len(renderer._uid_list_hit_rows), 8)
+        plt.close(renderer.fig)
+
+    def test_uid_od_list_scrolls_and_clicks_an_absolute_segment(self):
+        traj_df = pd.DataFrame([
+            {"uid": 9, "idx_o": i, "x_o": i, "y_o": 0, "z_o": -i,
+             "x_d": i + 1, "y_d": 0, "z_d": -(i + 1)}
+            for i in range(40)
+        ])
+        renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+        renderer.fig, renderer.ax_uid_list = plt.subplots()
+        renderer.traj_df = traj_df
+        renderer.state = mock.Mock(uid=9)
+        renderer.current_idx = 0
+        renderer.labeled_modes = {}
+        renderer._uid_segment_positions = {9: np.arange(40, dtype=np.int32)}
+        renderer._uid_list_uid = None
+        renderer._uid_list_offset = 0
+        renderer._uid_list_hit_rows = []
+        renderer.segment_select_callback = mock.Mock()
+        renderer._draw_uid_segment_list(ensure_current=True)
+
+        renderer._on_uid_list_scroll(mock.Mock(
+            inaxes=renderer.ax_uid_list, step=-1, button="down",
+        ))
+        self.assertEqual(renderer._uid_list_offset, LabelPath.UID_LIST_SCROLL_STEP)
+
+        y_min, y_max, target = renderer._uid_list_hit_rows[0]
+        renderer._on_uid_list_click(mock.Mock(
+            inaxes=renderer.ax_uid_list, ydata=(y_min + y_max) / 2, button=1,
+        ))
+        renderer.segment_select_callback.assert_called_once_with(target)
+        self.assertEqual(target, LabelPath.UID_LIST_SCROLL_STEP)
+        plt.close(renderer.fig)
+
+    def test_uid_navigation_uses_solid_dot_only_for_completed_uid(self):
+        traj_df = pd.DataFrame([
+            {"uid": uid, "idx_o": idx_o}
+            for uid in (10, 20, 30)
+            for idx_o in range(2)
+        ])
+        renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+        renderer.fig, renderer.ax_uid_nav = plt.subplots()
+        renderer.traj_df = traj_df
+        renderer.state = mock.Mock(uid=20)
+        renderer.current_idx = 2
+        renderer.labeled_modes = {
+            (10, 0): "TG", (10, 1): "TS", (20, 0): "GG",
+        }
+        renderer._uid_segment_positions = {
+            10: np.asarray([0, 1]), 20: np.asarray([2, 3]), 30: np.asarray([4, 5]),
+        }
+        renderer._uid_nav_values = np.asarray([10, 20, 30])
+        renderer._uid_nav_index = {10: 0, 20: 1, 30: 2}
+        renderer._uid_labeled_counts = {10: 2, 20: 1, 30: 0}
+        renderer._uid_nav_offset = 0
+        renderer._uid_nav_hit_rows = []
+
+        renderer._draw_uid_navigation_list(ensure_current=True)
+
+        facecolors = renderer.ax_uid_nav.collections[0].get_facecolors()
+        self.assertEqual(facecolors[0, 3], 1.0)
+        self.assertEqual(facecolors[1, 3], 0.0)
+        self.assertEqual(facecolors[2, 3], 0.0)
+        self.assertTrue(any(patch.get_edgecolor()[2] > 0.7
+                            for patch in renderer.ax_uid_nav.patches))
+        plt.close(renderer.fig)
+
+    def test_uid_navigation_scrolls_and_opens_first_unlabeled_od(self):
+        traj_df = pd.DataFrame([
+            {"uid": uid, "idx_o": 0} for uid in range(40)
+        ])
+        renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+        renderer.fig, renderer.ax_uid_nav = plt.subplots()
+        renderer.traj_df = traj_df
+        renderer.state = mock.Mock(uid=0)
+        renderer.current_idx = 0
+        renderer.labeled_modes = {}
+        renderer._uid_segment_positions = {
+            uid: np.asarray([uid], dtype=np.int32) for uid in range(40)
+        }
+        renderer._uid_nav_values = np.arange(40, dtype=np.int64)
+        renderer._uid_nav_index = {uid: uid for uid in range(40)}
+        renderer._uid_labeled_counts = {uid: 0 for uid in range(40)}
+        renderer._uid_nav_offset = 0
+        renderer._uid_nav_hit_rows = []
+        renderer.segment_select_callback = mock.Mock()
+        renderer._draw_uid_navigation_list(ensure_current=True)
+
+        renderer._on_uid_nav_scroll(mock.Mock(
+            inaxes=renderer.ax_uid_nav, step=-1, button="down",
+        ))
+        self.assertEqual(renderer._uid_nav_offset, LabelPath.UID_NAV_SCROLL_STEP)
+
+        y_min, y_max, uid = renderer._uid_nav_hit_rows[0]
+        renderer._on_uid_nav_click(mock.Mock(
+            inaxes=renderer.ax_uid_nav, ydata=(y_min + y_max) / 2, button=1,
+        ))
+        renderer.segment_select_callback.assert_called_once_with(uid)
+        self.assertEqual(uid, LabelPath.UID_NAV_SCROLL_STEP)
         plt.close(renderer.fig)
 
     def test_batch_controller_navigates_without_closing_window(self):
