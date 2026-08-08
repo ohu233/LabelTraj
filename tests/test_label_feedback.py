@@ -298,7 +298,88 @@ class LabelFeedbackTest(unittest.TestCase):
                             for color in rendered_colors))
         self.assertTrue(any(np.allclose(color, LabelPath.MODE_COLORS["GG"])
                             for color in rendered_colors))
+        hovered_sequences = {
+            record[2]
+            for _artist, records in renderer._point_scatter_meta
+            for record in records
+        }
+        self.assertEqual(hovered_sequences, {1, 2, 5, 6})
         plt.close(renderer.fig)
+
+    def test_point_sequence_uses_original_uid_list_number_across_merged_od(self):
+        renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+        renderer.traj_df = pd.DataFrame([
+            {"uid": 7, "idx_o": 10, "idx_d": 11},
+            {"uid": 7, "idx_o": 11, "idx_d": 12},
+            {"uid": 7, "idx_o": 12, "idx_d": 13},
+        ])
+        renderer._uid_segment_positions = {7: np.asarray([0, 1, 2])}
+        renderer._uid_point_sequence_cache = {}
+
+        self.assertEqual(renderer._point_sequence_number(7, 10, 0), 1)
+        self.assertEqual(renderer._point_sequence_number(7, 12, 0, True), 3)
+        self.assertEqual(renderer._point_sequence_number(7, 13, 2, True), 4)
+
+    def test_main_view_hover_shows_trajectory_point_sequence(self):
+        renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+        renderer.fig, renderer.ax = plt.subplots()
+        renderer._point_hover = renderer.ax.annotate("", (0, 0))
+        renderer._point_hover.set_visible(False)
+        renderer._poi_hover = None
+        renderer._poi_scatter_meta = []
+        artist = mock.Mock()
+        artist.contains.return_value = (True, {"ind": [0]})
+        renderer._point_scatter_meta = [(artist, [(1.0, 2.0, 17)])]
+
+        renderer._on_poi_hover(mock.Mock(inaxes=renderer.ax))
+
+        self.assertTrue(renderer._point_hover.get_visible())
+        self.assertEqual(renderer._point_hover.get_text(), "序号: 17")
+        self.assertEqual(renderer._point_hover.xy, (1.0, 2.0))
+        plt.close(renderer.fig)
+
+    def test_road_hex_hover_lists_only_enabled_road_layers(self):
+        renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+        renderer.fig, renderer.ax = plt.subplots()
+        renderer._point_hover = None
+        renderer._poi_hover = None
+        renderer._point_scatter_meta = []
+        renderer._poi_scatter_meta = []
+        renderer._road_hover = renderer.ax.annotate("", (0, 0))
+        renderer._road_hover.set_visible(False)
+        hex_key = (1, -2, 1)
+        renderer.raw_mapdata = {
+            hex_key: {"code": (1 << 12) | (1 << 9)},  # TG + GG
+        }
+        renderer.road_sets = {}
+        renderer.road_visibility = {
+            mode: mode != "TG" for mode in LabelPath.MODE_LIST
+        }
+        renderer._hovered_hex_from_event = mock.Mock(return_value=hex_key)
+        event = mock.Mock(inaxes=renderer.ax, xdata=4.0, ydata=5.0)
+
+        renderer._on_poi_hover(event)
+
+        self.assertTrue(renderer._road_hover.get_visible())
+        self.assertIn("[GG]高速", renderer._road_hover.get_text())
+        self.assertNotIn("TG", renderer._road_hover.get_text())
+
+        renderer.road_visibility["GG"] = False
+        renderer._on_poi_hover(event)
+        self.assertFalse(renderer._road_hover.get_visible())
+        plt.close(renderer.fig)
+
+    def test_hovered_display_coordinate_round_trips_to_hex(self):
+        hex_key = (1786, -2429, 643)
+        mx, my = LabelPath.hex_to_mercator(*hex_key)
+        gx, gy = LabelPath.mercator_wgs84_to_gcj02(mx, my)
+        renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+
+        result = renderer._hovered_hex_from_event(mock.Mock(
+            xdata=float(gx), ydata=float(gy),
+        ))
+
+        self.assertEqual(result, hex_key)
 
     def test_context_draws_all_visible_uid_points_without_rescaling(self):
         traj_df = pd.DataFrame([

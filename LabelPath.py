@@ -57,6 +57,7 @@ from utils.geo_utils import (
     _init_hex_origin,
     get_hex_grid,
     mercator_wgs84_to_gcj02,
+    gcj02_to_wgs84,
 )
 from utils.basemap import add_basemap, USE_BASEMAP
 from utils.osm_pois import (
@@ -693,6 +694,7 @@ class PathRenderer:
         self._uid_list_hit_rows = []
         self._uid_nav_offset = 0
         self._uid_nav_hit_rows = []
+        self._uid_point_sequence_cache = {}
         self._prepare_static_indexes()
 
         # 五栏：UID 列表、当前 UID 的 OD 列表、地图、信息栏、速度分布。
@@ -792,6 +794,9 @@ class PathRenderer:
         self.current_idx = current_idx
         self._poi_scatter_meta = []
         self._poi_hover = None
+        self._point_scatter_meta = []
+        self._point_hover = None
+        self._road_hover = None
         self._road_artists = {}
         self.ax.clear()
         self._draw_uid_navigation_list(ensure_current=True)
@@ -859,6 +864,61 @@ class PathRenderer:
         self.labeled_modes[key] = mode
         if is_new_resolution and key[0] in self._uid_resolved_counts:
             self._uid_resolved_counts[key[0]] += 1
+
+    def _point_sequence_number(self, uid, point_idx=None, position=None,
+                               destination=False):
+        """Return the 1-based point number shown in the current UID list."""
+        uid = int(uid)
+        cache = getattr(self, "_uid_point_sequence_cache", None)
+        if cache is None:
+            cache = {}
+            self._uid_point_sequence_cache = cache
+        if uid not in cache:
+            positions = self._uid_segment_positions.get(
+                uid, np.empty(0, dtype=np.int32),
+            )
+            point_numbers = {}
+            position_numbers = {}
+            for local_index, global_position in enumerate(positions):
+                global_position = int(global_position)
+                ordinal = local_index + 1
+                position_numbers[global_position] = ordinal
+                row = self.traj_df.iloc[global_position]
+                for column, number in (("idx_o", ordinal), ("idx_d", ordinal + 1)):
+                    try:
+                        point_numbers.setdefault(int(row[column]), number)
+                    except (KeyError, TypeError, ValueError, OverflowError):
+                        continue
+            cache[uid] = point_numbers, position_numbers
+        point_numbers, position_numbers = cache[uid]
+        try:
+            number = point_numbers.get(int(point_idx))
+        except (TypeError, ValueError, OverflowError):
+            number = None
+        if number is not None:
+            return int(number)
+        if position is None:
+            return None
+        number = position_numbers.get(int(position))
+        if number is None:
+            return None
+        return int(number + (1 if destination else 0))
+
+    def _register_point_hover(self, artist, xs, ys, sequence_numbers):
+        """Register one trajectory-point scatter artist for hover lookup."""
+        records = [
+            (
+                float(x), float(y),
+                None if sequence is None else int(sequence),
+            )
+            for x, y, sequence in zip(
+                np.atleast_1d(xs), np.atleast_1d(ys), sequence_numbers,
+            )
+        ]
+        if any(record[2] is not None for record in records):
+            if not hasattr(self, "_point_scatter_meta"):
+                self._point_scatter_meta = []
+            self._point_scatter_meta.append((artist, records))
 
     def _recount_uid_resolved(self, uid):
         positions = self._uid_segment_positions.get(uid, np.empty(0, dtype=np.int32))
@@ -1397,6 +1457,9 @@ class PathRenderer:
         artist = self._road_artists.get(mode_name)
         if artist is not None:
             artist.set_visible(is_visible)
+        road_hover = getattr(self, "_road_hover", None)
+        if road_hover is not None:
+            road_hover.set_visible(False)
         self._update_road_button_style(mode_name)
         self.fig.canvas.draw_idle()
 
@@ -1484,6 +1547,12 @@ class PathRenderer:
             c="#39d353", marker="o", s=58,
             edgecolors="darkgreen", linewidths=1.4, zorder=8, label="Start",
         )
+        start_sequence = self._point_sequence_number(
+            state.uid, state.row.get("idx_o"), self.current_idx,
+        )
+        self._register_point_hover(
+            self.start_handle, [start_mx], [start_my], [start_sequence],
+        )
         self.ax.scatter(
             end_mx, end_my,
             c="white", marker="o", s=142,
@@ -1493,6 +1562,13 @@ class PathRenderer:
             end_mx, end_my,
             c="#ff2538", marker="X", s=102,
             edgecolors="#8b0015", linewidths=1.4, zorder=8.2, label="End",
+        )
+        end_sequence = self._point_sequence_number(
+            state.uid, state.row.get("idx_d"), self.current_idx,
+            destination=True,
+        )
+        self._register_point_hover(
+            self.end_handle, [end_mx], [end_my], [end_sequence],
         )
         (self.path_line,) = self.ax.plot(
             [], [], "-",
@@ -1509,6 +1585,24 @@ class PathRenderer:
 
         # ---- 上下文参考点（前一段起点 / 后一段终点）----
         self._draw_context_points(state)
+        self._point_hover = self.ax.annotate(
+            "", xy=(0, 0), xytext=(8, 8), textcoords="offset points",
+            fontsize=8.5, fontweight="bold", color="#202020", zorder=9,
+            bbox=dict(
+                boxstyle="round", facecolor="#fff7cc",
+                edgecolor="#555555", alpha=0.96,
+            ),
+        )
+        self._point_hover.set_visible(False)
+        self._road_hover = self.ax.annotate(
+            "", xy=(0, 0), xytext=(8, 8), textcoords="offset points",
+            fontsize=8.2, fontweight="bold", color="#203040", zorder=8.9,
+            bbox=dict(
+                boxstyle="round", facecolor="#e8f4ff",
+                edgecolor="#4b6f8f", alpha=0.96,
+            ),
+        )
+        self._road_hover.set_visible(False)
 
         # ---- 右侧：速度分布直方图 ----
         self._draw_velocity_hist(state)
@@ -1547,7 +1641,7 @@ class PathRenderer:
 
         def _project_rows(positions, prefix):
             if not len(positions):
-                return np.empty(0), np.empty(0)
+                return np.empty(0), np.empty(0), np.empty(0, dtype=object)
             if prefix == "d" and ignored_points:
                 rows = pd.DataFrame([
                     effective_segment_row(traj_df, int(position), ignored_points)
@@ -1561,10 +1655,18 @@ class PathRenderer:
                 rows[f"z_{prefix}"].to_numpy(dtype=np.int64),
             )
             gx, gy = mercator_wgs84_to_gcj02(mx, my)
-            return np.asarray(gx), np.asarray(gy)
+            point_column = f"idx_{prefix}"
+            sequence_numbers = np.asarray([
+                self._point_sequence_number(
+                    state.uid, row.get(point_column), int(position),
+                    destination=prefix == "d",
+                )
+                for position, (_, row) in zip(positions, rows.iterrows())
+            ], dtype=object)
+            return np.asarray(gx), np.asarray(gy), sequence_numbers
 
-        prev_x, prev_y = _project_rows(previous_positions, "o")
-        next_x, next_y = _project_rows(next_positions, "d")
+        prev_x, prev_y, prev_sequences = _project_rows(previous_positions, "o")
+        next_x, next_y, next_sequences = _project_rows(next_positions, "d")
         start_x, start_y = hex_to_mercator(*state.start)
         start_x, start_y = mercator_wgs84_to_gcj02(start_x, start_y)
         end_x, end_y = hex_to_mercator(*state.end)
@@ -1592,7 +1694,8 @@ class PathRenderer:
             mode = self.labeled_modes.get(_annotation_key(row_i))
             return LABELED_POINT_COLORS.get(mode, fallback)
 
-        def _draw_visible(positions, xs, ys, fallback, edge, near_position, near_size):
+        def _draw_visible(positions, xs, ys, sequence_numbers, fallback, edge,
+                          near_position, near_size):
             if not len(positions):
                 return
             visible = (
@@ -1603,30 +1706,37 @@ class PathRenderer:
             far = visible & ~near
             if far.any():
                 far_positions = positions[far]
-                self.ax.scatter(
+                artist = self.ax.scatter(
                     xs[far], ys[far],
                     c=[_saved_color(int(row_idx), fallback) for row_idx in far_positions],
                     marker="D", s=28, edgecolors=edge, linewidths=0.9,
                     alpha=CONTEXT_ALPHA, zorder=6.6,
                 )
+                self._register_point_hover(
+                    artist, xs[far], ys[far], sequence_numbers[far],
+                )
             if near.any():
                 near_index = int(np.flatnonzero(near)[0])
                 row_idx = int(positions[near_index])
-                self.ax.scatter(
+                artist = self.ax.scatter(
                     [xs[near_index]], [ys[near_index]],
                     c=[_saved_color(row_idx, fallback)], marker="D",
                     s=near_size, edgecolors=edge, linewidths=1.5,
                     alpha=CONTEXT_ALPHA, zorder=7.25,
                 )
+                self._register_point_hover(
+                    artist, [xs[near_index]], [ys[near_index]],
+                    [sequence_numbers[near_index]],
+                )
 
         nearest_previous = int(previous_positions[-1]) if len(previous_positions) else -1
         nearest_next = int(next_positions[0]) if len(next_positions) else -1
         _draw_visible(
-            previous_positions, prev_x, prev_y,
+            previous_positions, prev_x, prev_y, prev_sequences,
             "#d8a24a", "#7a4b00", nearest_previous, 42,
         )
         _draw_visible(
-            next_positions, next_x, next_y,
+            next_positions, next_x, next_y, next_sequences,
             "deepskyblue", "#005bbb", nearest_next, 46,
         )
 
@@ -1798,24 +1908,125 @@ class PathRenderer:
                       edgecolor="none"),
         )
 
+    def _visible_road_descriptions(self, hex_key):
+        """Return enabled rendered road classes present in one hex cell."""
+        try:
+            cell = self.raw_mapdata[tuple(int(value) for value in hex_key)]
+            code = int(cell.get("code", 0) if hasattr(cell, "get") else cell)
+        except (KeyError, IndexError, TypeError, ValueError, OverflowError):
+            code = 0
+        descriptions = []
+        seen = set()
+        for key, label in decode_road_code(code):
+            mode = ROAD_KEY_TO_MODE.get(key)
+            if mode and self.road_visibility.get(mode, True):
+                item = (mode, label)
+                if item not in seen:
+                    seen.add(item)
+                    descriptions.append(item)
+        if descriptions:
+            return descriptions
+
+        # Compatibility fallback for mapdata without a readable code field.
+        normalized_key = tuple(int(value) for value in hex_key)
+        for mode in MODE_LIST:
+            if not self.road_visibility.get(mode, True):
+                continue
+            road_sets = getattr(self, "road_sets", None)
+            if road_sets and normalized_key in road_sets.get(mode, set()):
+                descriptions.append((mode, MODE_LABELS.get(mode, mode)))
+        return descriptions
+
+    def _hovered_hex_from_event(self, event):
+        """Convert a main-view GCJ Mercator mouse position to one WGS84 hex."""
+        if event.xdata is None or event.ydata is None:
+            return None
+        try:
+            from utils.geo_utils import _merc_to_wgs84
+            gcj_lon, gcj_lat = _merc_to_wgs84.transform(
+                float(event.xdata), float(event.ydata),
+            )
+            wgs_lon, wgs_lat = gcj02_to_wgs84(gcj_lon, gcj_lat)
+            hex_x, hex_y, hex_z = wgs84_to_hex(wgs_lon, wgs_lat)
+            return int(hex_x), int(hex_y), int(hex_z)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
     def _on_poi_hover(self, event):
-        """Show category and OSM name when hovering over a POI marker."""
-        if self._poi_hover is None:
-            return
+        """Show a point number, OSM POI name, or enabled road-cell classes."""
+        point_hover = getattr(self, "_point_hover", None)
+        poi_hover = getattr(self, "_poi_hover", None)
+        road_hover = getattr(self, "_road_hover", None)
         if event.inaxes is self.ax:
-            for artist, records in reversed(self._poi_scatter_meta):
-                contains, details = artist.contains(event)
-                indices = details.get("ind", []) if contains else []
-                if len(indices):
-                    record = records[int(indices[0])]
-                    self._poi_hover.xy = (record["_display_x"], record["_display_y"])
-                    category = POI_CATEGORY_LABELS.get(record["category"], record["category"])
-                    self._poi_hover.set_text(f"{category}: {record.get('name', '未命名')}")
-                    self._poi_hover.set_visible(True)
-                    self.fig.canvas.draw_idle()
-                    return
-        if self._poi_hover.get_visible():
-            self._poi_hover.set_visible(False)
+            if point_hover is not None:
+                for artist, records in reversed(
+                        getattr(self, "_point_scatter_meta", [])):
+                    contains, details = artist.contains(event)
+                    indices = details.get("ind", []) if contains else []
+                    if len(indices):
+                        x, y, sequence = records[int(indices[0])]
+                        if sequence is None:
+                            continue
+                        point_hover.xy = (x, y)
+                        point_hover.set_text(f"序号: {sequence}")
+                        point_hover.set_visible(True)
+                        if poi_hover is not None:
+                            poi_hover.set_visible(False)
+                        if road_hover is not None:
+                            road_hover.set_visible(False)
+                        self.fig.canvas.draw_idle()
+                        return
+            if point_hover is not None and point_hover.get_visible():
+                point_hover.set_visible(False)
+
+            if poi_hover is not None:
+                for artist, records in reversed(
+                        getattr(self, "_poi_scatter_meta", [])):
+                    contains, details = artist.contains(event)
+                    indices = details.get("ind", []) if contains else []
+                    if len(indices):
+                        record = records[int(indices[0])]
+                        poi_hover.xy = (record["_display_x"], record["_display_y"])
+                        category = POI_CATEGORY_LABELS.get(
+                            record["category"], record["category"],
+                        )
+                        poi_hover.set_text(
+                            f"{category}: {record.get('name', '未命名')}"
+                        )
+                        poi_hover.set_visible(True)
+                        if road_hover is not None:
+                            road_hover.set_visible(False)
+                        self.fig.canvas.draw_idle()
+                        return
+            if poi_hover is not None and poi_hover.get_visible():
+                poi_hover.set_visible(False)
+
+            if road_hover is not None:
+                hex_key = self._hovered_hex_from_event(event)
+                if hex_key is not None:
+                    descriptions = self._visible_road_descriptions(hex_key)
+                    if descriptions:
+                        road_hover.xy = (float(event.xdata), float(event.ydata))
+                        road_hover.set_text(
+                            "路网: " + "  ".join(
+                                f"[{road_mode}]{label}"
+                                for road_mode, label in descriptions
+                            )
+                        )
+                        road_hover.set_visible(True)
+                        self.fig.canvas.draw_idle()
+                        return
+        changed = False
+        if point_hover is not None and point_hover.get_visible():
+            point_hover.set_visible(False)
+            changed = True
+        if poi_hover is not None and poi_hover.get_visible():
+            poi_hover.set_visible(False)
+            changed = True
+        if road_hover is not None and road_hover.get_visible():
+            road_hover.set_visible(False)
+            changed = True
+        if changed:
             self.fig.canvas.draw_idle()
 
     def _update_title(self):
