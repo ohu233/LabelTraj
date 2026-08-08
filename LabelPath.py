@@ -94,6 +94,7 @@ HEX_PKL_PATH = r"data\hex_grid_2025.pkl"
 
 DEFAULT_CSV_PATH = r"data\dataset_multicity_20230917_unpacked.csv"
 DEFAULT_OUTPUT_DIR = "label_output"
+IGNORED_POINT_FILENAME = "ignored_points.csv"
 
 DISTANCE_THRESHOLD = 1.0
 
@@ -188,8 +189,111 @@ def load_labeled_modes(output_dir):
     return result
 
 
-def first_unlabeled_index(traj_df, labeled_modes):
-    """Return the first unfinished OD, falling back to index 0."""
+def load_ignored_points(output_dir):
+    """Load persisted sampled-point keys excluded from OD construction."""
+    csv_path = os.path.join(output_dir, IGNORED_POINT_FILENAME)
+    if not os.path.exists(csv_path):
+        return set()
+    try:
+        ignored = pd.read_csv(csv_path, encoding="utf-8")
+    except (OSError, ValueError, pd.errors.ParserError) as exc:
+        print(f"  [WARN] Failed to load ignored points: {exc}")
+        return set()
+    if not {"uid", "idx"}.issubset(ignored.columns):
+        print("  [WARN] Ignored point file lacks uid/idx columns")
+        return set()
+    result = set()
+    for uid, point_idx in ignored[["uid", "idx"]].itertuples(index=False, name=None):
+        try:
+            result.add((int(uid), int(point_idx)))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return result
+
+
+def save_ignored_points(output_dir, ignored_points):
+    """Persist ignored sampled-point keys atomically."""
+    os.makedirs(output_dir, exist_ok=True)
+    csv_path = os.path.join(output_dir, IGNORED_POINT_FILENAME)
+    temp_path = csv_path + ".tmp"
+    rows = sorted((int(uid), int(point_idx)) for uid, point_idx in ignored_points)
+    pd.DataFrame(rows, columns=["uid", "idx"]).to_csv(
+        temp_path, index=False, encoding="utf-8",
+    )
+    os.replace(temp_path, csv_path)
+
+
+def remove_labeled_keys(output_dir, keys):
+    """Remove OD labels made invalid by an ignored/restored sampled point."""
+    keys = {tuple(map(int, key)) for key in keys if key is not None}
+    if not keys or not output_dir:
+        return 0
+    csv_path = os.path.join(output_dir, "traj_labeled.csv")
+    if not os.path.exists(csv_path):
+        return 0
+    labeled = pd.read_csv(csv_path, encoding="utf-8")
+    if labeled.empty or not {"uid", "idx_o"}.issubset(labeled.columns):
+        return 0
+    uid_values = pd.to_numeric(labeled["uid"], errors="coerce")
+    idx_values = pd.to_numeric(labeled["idx_o"], errors="coerce")
+    invalid_mask = np.fromiter(
+        (
+            not pd.isna(uid) and not pd.isna(idx_o)
+            and (int(uid), int(idx_o)) in keys
+            for uid, idx_o in zip(uid_values, idx_values)
+        ),
+        dtype=bool, count=len(labeled),
+    )
+    if not invalid_mask.any():
+        return 0
+
+    active = labeled.loc[~invalid_mask]
+    active_temp = csv_path + ".tmp"
+    active.to_csv(active_temp, index=False, encoding="utf-8")
+    os.replace(active_temp, csv_path)
+    return int(invalid_mask.sum())
+
+
+def sort_labeled_records(labeled):
+    """Return active labels in deterministic source-trajectory order."""
+    if labeled is None or labeled.empty:
+        return labeled
+    records = labeled.reset_index(drop=True)
+    sort_columns = [column for column in ("uid", "idx_o", "idx_d")
+                    if column in records.columns]
+    if not sort_columns:
+        return records
+    helper = pd.DataFrame(index=records.index)
+    helper["_position"] = np.arange(len(records), dtype=np.int64)
+    helper_columns = []
+    for column in sort_columns:
+        helper_column = f"_sort_{column}"
+        helper[helper_column] = pd.to_numeric(records[column], errors="coerce")
+        helper_columns.append(helper_column)
+    order = helper.sort_values(
+        helper_columns + ["_position"], kind="mergesort", na_position="last",
+    ).index
+    return records.iloc[order].reset_index(drop=True)
+
+
+def normalize_label_storage(output_dir):
+    """Sort active labels into deterministic source-trajectory order."""
+    csv_path = os.path.join(output_dir, "traj_labeled.csv")
+    if not os.path.exists(csv_path):
+        return 0
+    active = pd.read_csv(csv_path, encoding="utf-8")
+    ordered = sort_labeled_records(active)
+    reordered = int(not ordered.equals(active.reset_index(drop=True)))
+    if reordered:
+        active_temp = csv_path + ".tmp"
+        ordered.to_csv(active_temp, index=False, encoding="utf-8")
+        os.replace(active_temp, csv_path)
+    return reordered
+
+
+def first_unlabeled_index(traj_df, labeled_modes, ignored_points=None):
+    """Return the first unfinished OD, then the first reviewable OD."""
+    ignored_points = ignored_points or set()
     if traj_df is None or traj_df.empty:
         return 0
     if not {"uid", "idx_o"}.issubset(traj_df.columns):
@@ -197,9 +301,59 @@ def first_unlabeled_index(traj_df, labeled_modes):
     uid_values = pd.to_numeric(traj_df["uid"], errors="coerce").to_numpy()
     idx_o_values = pd.to_numeric(traj_df["idx_o"], errors="coerce").to_numpy()
     for position, (uid, idx_o) in enumerate(zip(uid_values, idx_o_values)):
-        if pd.isna(uid) or pd.isna(idx_o) or (int(uid), int(idx_o)) not in labeled_modes:
+        key = None if pd.isna(uid) or pd.isna(idx_o) else (int(uid), int(idx_o))
+        if key is None or (key not in labeled_modes and key not in ignored_points):
+            return position
+    for position, (uid, idx_o) in enumerate(zip(uid_values, idx_o_values)):
+        key = None if pd.isna(uid) or pd.isna(idx_o) else (int(uid), int(idx_o))
+        if key not in ignored_points:
             return position
     return 0
+
+
+def next_nonignored_index(traj_df, ignored_points, current_idx, direction):
+    """Return the next global row not ignored, or an out-of-range sentinel."""
+    step = 1 if int(direction) >= 0 else -1
+    target = int(current_idx) + step
+    while 0 <= target < len(traj_df):
+        if _annotation_key(traj_df.iloc[target]) not in ignored_points:
+            return target
+        target += step
+    return len(traj_df) if step > 0 else -1
+
+
+def effective_segment_row(traj_df, index, ignored_points=None):
+    """Merge OD intervals across ignored intermediate sampled points."""
+    ignored_points = ignored_points or set()
+    index = int(index)
+    row = traj_df.iloc[index].copy()
+    uid = int(row["uid"])
+    cursor = index
+    total_time = float(pd.to_numeric(pd.Series([row.get("time_d", 0)]), errors="coerce").fillna(0).iloc[0])
+    total_dist = float(pd.to_numeric(pd.Series([row.get("dist_d", 0)]), errors="coerce").fillna(0).iloc[0])
+    last_row = row
+
+    while cursor + 1 < len(traj_df):
+        candidate = traj_df.iloc[cursor + 1]
+        if int(candidate["uid"]) != uid or _annotation_key(candidate) not in ignored_points:
+            break
+        cursor += 1
+        last_row = candidate
+        total_time += float(pd.to_numeric(pd.Series([candidate.get("time_d", 0)]), errors="coerce").fillna(0).iloc[0])
+        total_dist += float(pd.to_numeric(pd.Series([candidate.get("dist_d", 0)]), errors="coerce").fillna(0).iloc[0])
+
+    if cursor != index:
+        for column in ("x_d", "y_d", "z_d", "idx_d"):
+            if column in row.index and column in last_row.index:
+                row[column] = last_row[column]
+        row["time_d"] = total_time
+        row["dist_d"] = total_dist
+        fallback_velocity = float(last_row.get("velocity_d", row.get("velocity_d", 0)) or 0)
+        row["velocity_d"] = (
+            total_dist / total_time * 3.6
+            if total_time > 0 and total_dist > 0 else fallback_velocity
+        )
+    return row
 
 # ========================== Hex Key Bindings ==========================
 HEX_KEY_MAP = {
@@ -435,12 +589,13 @@ class PathRenderer:
 
     def __init__(self, state: LabelState, raw_mapdata, road_sets=None,
                  traj_df=None, current_idx=None, output_dir=None, pois=None,
-                 labeled_modes=None):
+                 labeled_modes=None, ignored_points=None):
         self.raw_mapdata = raw_mapdata
         self.road_sets = road_sets
         self.traj_df = traj_df
         self.output_dir = output_dir
         self.labeled_modes = labeled_modes if labeled_modes is not None else {}
+        self.ignored_points = ignored_points if ignored_points is not None else set()
         self.pois = pois or []
         self.pois_by_hex = group_pois_by_hex(self.pois)
         self.road_visibility = {mode: True for mode in MODE_LIST}
@@ -526,26 +681,26 @@ class PathRenderer:
             self._uid_nav_index = {
                 int(uid): index for index, uid in enumerate(self._uid_nav_values)
             }
-            labeled_idx_o_by_uid = {}
-            for uid, idx_o in self.labeled_modes:
-                labeled_idx_o_by_uid.setdefault(int(uid), set()).add(int(idx_o))
-            self._uid_labeled_counts = {uid: 0 for uid in self._uid_segment_positions}
+            resolved_idx_by_uid = {}
+            for uid, point_idx in set(self.labeled_modes) | set(self.ignored_points):
+                resolved_idx_by_uid.setdefault(int(uid), set()).add(int(point_idx))
+            self._uid_resolved_counts = {uid: 0 for uid in self._uid_segment_positions}
             if "idx_o" in self.traj_df.columns:
-                for uid, labeled_idx_os in labeled_idx_o_by_uid.items():
+                for uid, resolved_indices in resolved_idx_by_uid.items():
                     positions = self._uid_segment_positions.get(uid)
                     if positions is None:
                         continue
                     idx_o_values = pd.to_numeric(
                         self.traj_df.iloc[positions]["idx_o"], errors="coerce",
                     ).to_numpy()
-                    self._uid_labeled_counts[uid] = int(
-                        np.isin(idx_o_values, tuple(labeled_idx_os)).sum()
+                    self._uid_resolved_counts[uid] = int(
+                        np.isin(idx_o_values, tuple(resolved_indices)).sum()
                     )
         else:
             self._uid_segment_positions = {}
             self._uid_nav_values = np.empty(0, dtype=np.int64)
             self._uid_nav_index = {}
-            self._uid_labeled_counts = {}
+            self._uid_resolved_counts = {}
 
     def show_segment(self, state, current_idx, initial=False):
         """Render another OD in the existing figure instead of reopening it."""
@@ -616,10 +771,92 @@ class PathRenderer:
 
     def set_labeled_mode(self, key, mode):
         """Update one saved label and the UID completion counter."""
-        is_new = key not in self.labeled_modes
+        is_new_resolution = key not in self.labeled_modes and key not in self.ignored_points
         self.labeled_modes[key] = mode
-        if is_new and key[0] in self._uid_labeled_counts:
-            self._uid_labeled_counts[key[0]] += 1
+        if is_new_resolution and key[0] in self._uid_resolved_counts:
+            self._uid_resolved_counts[key[0]] += 1
+
+    def _recount_uid_resolved(self, uid):
+        positions = self._uid_segment_positions.get(uid, np.empty(0, dtype=np.int32))
+        resolved_keys = set(self.labeled_modes) | set(self.ignored_points)
+        self._uid_resolved_counts[uid] = sum(
+            _annotation_key(self.traj_df.iloc[int(position)])
+            in resolved_keys
+            for position in positions
+        )
+
+    def _previous_nonignored_position(self, target):
+        uid = int(self.traj_df.iloc[int(target)]["uid"])
+        for position in range(int(target) - 1, -1, -1):
+            row = self.traj_df.iloc[position]
+            if int(row["uid"]) != uid:
+                break
+            if _annotation_key(row) not in self.ignored_points:
+                return position
+        return None
+
+    def _toggle_ignored_point(self, target):
+        """Ignore/restore one sampled point and invalidate changed adjacent ODs."""
+        target = int(target)
+        row = self.traj_df.iloc[target]
+        key = _annotation_key(row)
+        if key is None:
+            return
+        was_ignored = key in self.ignored_points
+        previous_position = self._previous_nonignored_position(target)
+        previous_key = (
+            _annotation_key(self.traj_df.iloc[previous_position])
+            if previous_position is not None else None
+        )
+        affected_keys = {item for item in (key, previous_key) if item is not None}
+        action = "restored" if was_ignored else "ignored"
+
+        updated_points = set(self.ignored_points)
+        if was_ignored:
+            updated_points.remove(key)
+        else:
+            updated_points.add(key)
+
+        # Persist the point state first. If removing the affected labels
+        # fails, roll it back so the ignore file and active label CSV never
+        # intentionally disagree.
+        try:
+            if self.output_dir:
+                save_ignored_points(self.output_dir, updated_points)
+            remove_labeled_keys(self.output_dir, affected_keys)
+        except (OSError, ValueError, pd.errors.ParserError) as exc:
+            if self.output_dir:
+                try:
+                    save_ignored_points(self.output_dir, self.ignored_points)
+                except OSError as rollback_exc:
+                    print(f"  [WARN] Failed to roll back ignored points: {rollback_exc}")
+            print(f"  [WARN] Failed to update ignored point: {exc}")
+            return
+        for affected_key in affected_keys:
+            self.labeled_modes.pop(affected_key, None)
+
+        self.ignored_points.clear()
+        self.ignored_points.update(updated_points)
+        self._recount_uid_resolved(key[0])
+        self.refresh_uid_segment_list()
+        print(f"  [POINT {action.upper()}] uid={key[0]} idx={key[1]}")
+
+        if self.segment_select_callback is None:
+            return
+        if not was_ignored and target == self.current_idx:
+            next_target = next_nonignored_index(
+                self.traj_df, self.ignored_points, target, 1,
+            )
+            if next_target >= len(self.traj_df):
+                next_target = next_nonignored_index(
+                    self.traj_df, self.ignored_points, target, -1,
+                )
+            if 0 <= next_target < len(self.traj_df):
+                self.segment_select_callback(next_target)
+        elif previous_position == self.current_idx:
+            # The current OD endpoint changed because its next point was
+            # ignored/restored; rebuild this view immediately.
+            self.segment_select_callback(self.current_idx)
 
     def _draw_uid_navigation_list(self, ensure_current=False):
         """Draw the scrollable all-UID navigation list at the far left."""
@@ -669,7 +906,7 @@ class PathRenderer:
                 ))
 
             total_od = len(self._uid_segment_positions.get(uid, ()))
-            is_complete = total_od > 0 and self._uid_labeled_counts.get(uid, 0) >= total_od
+            is_complete = total_od > 0 and self._uid_resolved_counts.get(uid, 0) >= total_od
             dot_xs.append(0.10)
             dot_ys.append(y)
             dot_facecolors.append("#2ca02c" if is_complete else (1.0, 1.0, 1.0, 0.0))
@@ -725,12 +962,17 @@ class PathRenderer:
 
     def _first_unlabeled_position(self, uid):
         positions = self._uid_segment_positions.get(uid, np.empty(0, dtype=np.int32))
+        ignored_points = getattr(self, "ignored_points", set())
         if not len(positions):
             return None
         for position in positions:
-            if _annotation_key(self.traj_df.iloc[int(position)]) not in self.labeled_modes:
+            key = _annotation_key(self.traj_df.iloc[int(position)])
+            if key not in self.labeled_modes and key not in ignored_points:
                 return int(position)
-        return int(positions[0])
+        for position in positions:
+            if _annotation_key(self.traj_df.iloc[int(position)]) not in ignored_points:
+                return int(position)
+        return None
 
     def _on_uid_nav_click(self, event):
         if event.inaxes is not self.ax_uid_nav or event.ydata is None:
@@ -779,7 +1021,7 @@ class PathRenderer:
 
         ax.text(
             0.5, 0.975,
-            f"UID {self.state.uid}\nOD 列表  {current_local + 1} / {total}",
+            f"UID {self.state.uid}\n点 / OD 列表  {current_local + 1} / {total}",
             ha="center", va="top", fontsize=8.5, fontweight="bold",
             transform=ax.transAxes,
         )
@@ -787,6 +1029,8 @@ class PathRenderer:
         row_height = (top - bottom) / UID_LIST_VISIBLE_ROWS
         dot_xs, dot_ys = [], []
         dot_sizes, dot_facecolors, dot_edgecolors = [], [], []
+        ignored_xs, ignored_ys = [], []
+        ignored_points = getattr(self, "ignored_points", set())
         for visible_row, local_index in enumerate(range(self._uid_list_offset, stop)):
             global_index = int(positions[local_index])
             y = top - (visible_row + 0.5) * row_height
@@ -799,26 +1043,38 @@ class PathRenderer:
                 ))
 
             row = self.traj_df.iloc[global_index]
-            mode = self.labeled_modes.get(_annotation_key(row))
+            key = _annotation_key(row)
+            is_ignored = key in ignored_points
+            mode = None if is_ignored else self.labeled_modes.get(key)
             dot_color = LABELED_POINT_COLORS.get(mode)
-            dot_xs.append(0.14)
-            dot_ys.append(y)
-            dot_sizes.append(38 if dot_color is not None else 31)
-            if dot_color is None:
-                dot_facecolors.append((1.0, 1.0, 1.0, 0.0))
-                dot_edgecolors.append("#a5a5a5")
+            if is_ignored:
+                ignored_xs.append(0.14)
+                ignored_ys.append(y)
             else:
-                dot_facecolors.append((*dot_color, 1.0))
-                dot_edgecolors.append("#303030")
+                dot_xs.append(0.14)
+                dot_ys.append(y)
+                dot_sizes.append(38 if dot_color is not None else 31)
+                if dot_color is None:
+                    dot_facecolors.append((1.0, 1.0, 1.0, 0.0))
+                    dot_edgecolors.append("#a5a5a5")
+                else:
+                    dot_facecolors.append((*dot_color, 1.0))
+                    dot_edgecolors.append("#303030")
 
             ax.text(
                 0.25, y, f"{local_index + 1:>4d}",
                 ha="left", va="center", fontsize=8,
                 fontweight="bold" if is_current else "normal",
-                color="#005baa" if is_current else "#303030",
+                color="#9a9a9a" if is_ignored else ("#005baa" if is_current else "#303030"),
+                fontstyle="italic" if is_ignored else "normal",
                 transform=ax.transAxes,
             )
-            if mode is not None:
+            if is_ignored:
+                ax.text(
+                    0.88, y, "忽略", ha="right", va="center", fontsize=6.8,
+                    color="#777777", fontweight="bold", transform=ax.transAxes,
+                )
+            elif mode is not None:
                 ax.text(
                     0.88, y, mode, ha="right", va="center", fontsize=6.8,
                     color=dot_color, fontweight="bold", transform=ax.transAxes,
@@ -827,11 +1083,17 @@ class PathRenderer:
                 y - row_height * 0.5, y + row_height * 0.5, global_index,
             ))
 
-        ax.scatter(
-            dot_xs, dot_ys, s=dot_sizes, marker="o",
-            facecolors=dot_facecolors, edgecolors=dot_edgecolors,
-            linewidths=0.75, transform=ax.transAxes, zorder=2,
-        )
+        if dot_xs:
+            ax.scatter(
+                dot_xs, dot_ys, s=dot_sizes, marker="o",
+                facecolors=dot_facecolors, edgecolors=dot_edgecolors,
+                linewidths=0.75, transform=ax.transAxes, zorder=2,
+            )
+        if ignored_xs:
+            ax.scatter(
+                ignored_xs, ignored_ys, s=38, marker="x", c="#777777",
+                linewidths=1.25, transform=ax.transAxes, zorder=2,
+            )
 
         if total > UID_LIST_VISIBLE_ROWS:
             track_y, track_height = bottom, top - bottom
@@ -879,11 +1141,16 @@ class PathRenderer:
     def _on_uid_list_click(self, event):
         if event.inaxes is not self.ax_uid_list or event.ydata is None:
             return
-        if event.button != 1:
+        if event.button not in (1, 3):
             return
         for y_min, y_max, target in self._uid_list_hit_rows:
             if y_min <= event.ydata <= y_max:
-                if target != self.current_idx and self.segment_select_callback is not None:
+                key = _annotation_key(self.traj_df.iloc[int(target)])
+                if event.button == 3:
+                    self._toggle_ignored_point(target)
+                elif key not in getattr(self, "ignored_points", set()) \
+                        and target != self.current_idx \
+                        and self.segment_select_callback is not None:
                     self.segment_select_callback(target)
                 return
 
@@ -1098,13 +1365,25 @@ class PathRenderer:
             }
             self._uid_segment_positions = positions_by_uid
         uid_positions = positions_by_uid.get(state.uid, np.empty(0, dtype=np.int32))
+        ignored_points = getattr(self, "ignored_points", set())
+        if ignored_points:
+            uid_positions = np.asarray([
+                int(position) for position in uid_positions
+                if _annotation_key(traj_df.iloc[int(position)]) not in ignored_points
+            ], dtype=np.int32)
         previous_positions = uid_positions[uid_positions < idx]
         next_positions = uid_positions[uid_positions > idx]
 
         def _project_rows(positions, prefix):
             if not len(positions):
                 return np.empty(0), np.empty(0)
-            rows = traj_df.iloc[positions]
+            if prefix == "d" and ignored_points:
+                rows = pd.DataFrame([
+                    effective_segment_row(traj_df, int(position), ignored_points)
+                    for position in positions
+                ])
+            else:
+                rows = traj_df.iloc[positions]
             mx, my = hex_to_mercator(
                 rows[f"x_{prefix}"].to_numpy(dtype=np.int64),
                 rows[f"y_{prefix}"].to_numpy(dtype=np.int64),
@@ -1592,6 +1871,12 @@ class LabelController:
         canonical_mode = _canonical_label_mode(label)
         if canonical_mode is None:
             return
+        current_key = _annotation_key(self.state.row)
+        ignored_points = getattr(self.renderer, "ignored_points", set())
+        if isinstance(ignored_points, (set, frozenset)) \
+                and current_key in ignored_points:
+            print("  [IGNORED] Restore this point before labeling its OD")
+            return
         self._finalize(canonical_mode)
         self.saved = True
         print(f"  [LABELED] #{self.current_idx} -> {canonical_mode}")
@@ -1718,8 +2003,10 @@ class LabelController:
         # uid, idx_o, idx_d 放前三列
         front_cols = [c for c in ["uid", "idx_o", "idx_d"] if c in out_df.columns]
         other_cols = [c for c in out_df.columns if c not in front_cols]
-        out_df = out_df[front_cols + other_cols]
-        out_df.to_csv(csv_path, index=False, encoding="utf-8")
+        out_df = sort_labeled_records(out_df[front_cols + other_cols])
+        csv_temp = csv_path + ".tmp"
+        out_df.to_csv(csv_temp, index=False, encoding="utf-8")
+        os.replace(csv_temp, csv_path)
         self.renderer.refresh_uid_segment_list()
 
         print(f"  -> CSV: {csv_path}")
@@ -1734,12 +2021,13 @@ class LabelController:
 
 def run_single(state, raw_mapdata, output_dir, batch_mode, idx,
                road_sets=None, traj_df=None, pois=None,
-               labeled_modes=None):
+               labeled_modes=None, ignored_points=None):
     """Run labeling for one trajectory. Returns (next_idx, keep_going)."""
     renderer = PathRenderer(state, raw_mapdata, road_sets=road_sets,
-                            traj_df=traj_df, current_idx=idx,
-                            output_dir=output_dir, pois=pois,
-                            labeled_modes=labeled_modes)
+                             traj_df=traj_df, current_idx=idx,
+                             output_dir=output_dir, pois=pois,
+                             labeled_modes=labeled_modes,
+                             ignored_points=ignored_points)
     controller = LabelController(
         state, renderer, output_dir, batch_mode, idx,
     )
@@ -1748,7 +2036,8 @@ def run_single(state, raw_mapdata, output_dir, batch_mode, idx,
         if traj_df is None or not 0 <= int(target) < len(traj_df):
             return
         next_state = LabelState(
-            traj_df.iloc[int(target)], state.multi_mapdata, hex_grid=raw_mapdata,
+            effective_segment_row(traj_df, int(target), renderer.ignored_points),
+            state.multi_mapdata, hex_grid=raw_mapdata,
         )
         renderer.show_segment(next_state, int(target))
         controller.set_segment(next_state, int(target))
@@ -1792,7 +2081,7 @@ def _print_segment_status(idx, state):
 
 
 def run_continuous(start_idx, make_state, raw_mapdata, output_dir,
-                   road_sets, traj_df, pois, labeled_modes):
+                   road_sets, traj_df, pois, labeled_modes, ignored_points):
     """Run a batch in one persistent Matplotlib window.
 
     Static data and offline map tiles stay cached in the same process. Moving
@@ -1803,7 +2092,7 @@ def run_continuous(start_idx, make_state, raw_mapdata, output_dir,
     renderer = PathRenderer(
         state, raw_mapdata, road_sets=road_sets, traj_df=traj_df,
         current_idx=start_idx, output_dir=output_dir, pois=pois,
-        labeled_modes=labeled_modes,
+        labeled_modes=labeled_modes, ignored_points=ignored_points,
     )
     controller = LabelController(
         state, renderer, output_dir, batch_mode=True, current_idx=start_idx,
@@ -1826,7 +2115,10 @@ def run_continuous(start_idx, make_state, raw_mapdata, output_dir,
         _print_segment_status(target, next_state)
 
     def navigate(delta):
-        show_target(controller.current_idx + int(delta))
+        target = next_nonignored_index(
+            traj_df, renderer.ignored_points, controller.current_idx, delta,
+        )
+        show_target(target)
 
     controller.navigate_callback = navigate
     renderer.set_segment_select_callback(show_target)
@@ -1891,13 +2183,24 @@ def main():
     # 该集合对所有 OD 都相同，只构建一次，避免每次切换重复复制大集合。
     multi_mapdata = set().union(*road_sets.values()) if road_sets else set()
 
-    def make_state(row):
-        return LabelState(row, multi_mapdata, hex_grid=raw_mapdata)
-
     output_dir = args.output
+    try:
+        reordered = normalize_label_storage(output_dir)
+        if reordered:
+            print("Reordered active labels by uid/idx_o/idx_d")
+    except (OSError, ValueError, pd.errors.ParserError) as exc:
+        print(f"  [WARN] Failed to normalize label CSV storage: {exc}")
     labeled_modes = load_labeled_modes(output_dir)
     if labeled_modes:
         print(f"Loaded existing labels for map feedback: {len(labeled_modes):,}")
+    ignored_points = load_ignored_points(output_dir)
+    if ignored_points:
+        print(f"Loaded ignored sampled points: {len(ignored_points):,}")
+
+    def make_state(row):
+        position = int(traj_df.index.get_indexer([row.name])[0])
+        effective_row = effective_segment_row(traj_df, position, ignored_points)
+        return LabelState(effective_row, multi_mapdata, hex_grid=raw_mapdata)
 
     if args.index is not None:
         if args.index < 0 or args.index >= len(traj_df):
@@ -1906,15 +2209,15 @@ def main():
         state = make_state(traj_df.iloc[args.index])
         run_single(state, raw_mapdata, output_dir, batch_mode=False,
                    idx=args.index, road_sets=road_sets, traj_df=traj_df, pois=pois,
-                   labeled_modes=labeled_modes)
+                   labeled_modes=labeled_modes, ignored_points=ignored_points)
 
     else:
-        start_idx = first_unlabeled_index(traj_df, labeled_modes)
+        start_idx = first_unlabeled_index(traj_df, labeled_modes, ignored_points)
         print(f"Opening annotation view at first unfinished OD: #{start_idx}")
 
         run_continuous(
             start_idx, make_state, raw_mapdata, output_dir,
-            road_sets, traj_df, pois, labeled_modes,
+            road_sets, traj_df, pois, labeled_modes, ignored_points,
         )
 
 

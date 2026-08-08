@@ -42,6 +42,147 @@ class LabelFeedbackTest(unittest.TestCase):
             0,
         )
 
+    def test_startup_and_navigation_skip_ignored_points(self):
+        traj_df = pd.DataFrame([
+            {"uid": 10, "idx_o": 0},
+            {"uid": 10, "idx_o": 1},
+            {"uid": 10, "idx_o": 2},
+            {"uid": 10, "idx_o": 3},
+        ])
+        ignored = {(10, 1), (10, 2)}
+
+        self.assertEqual(LabelPath.first_unlabeled_index(traj_df, {}, ignored), 0)
+        self.assertEqual(LabelPath.next_nonignored_index(traj_df, ignored, 0, 1), 3)
+        self.assertEqual(LabelPath.next_nonignored_index(traj_df, ignored, 3, -1), 0)
+        all_resolved = {(10, 0): "TG", (10, 3): "GG"}
+        self.assertEqual(
+            LabelPath.first_unlabeled_index(traj_df, all_resolved, ignored), 0,
+        )
+        self.assertEqual(
+            LabelPath.first_unlabeled_index(
+                traj_df, {(10, 1): "TG", (10, 2): "TS", (10, 3): "GG"},
+                {(10, 0)},
+            ),
+            1,
+        )
+
+    def test_effective_segment_merges_intervals_across_ignored_point(self):
+        traj_df = pd.DataFrame([
+            {"uid": 7, "idx_o": 0, "idx_d": 1,
+             "x_o": 0, "y_o": 0, "z_o": 0, "x_d": 1, "y_d": 0, "z_d": -1,
+             "time_d": 10.0, "dist_d": 100.0, "velocity_d": 36.0},
+            {"uid": 7, "idx_o": 1, "idx_d": 2,
+             "x_o": 1, "y_o": 0, "z_o": -1, "x_d": 2, "y_d": 0, "z_d": -2,
+             "time_d": 20.0, "dist_d": 400.0, "velocity_d": 72.0},
+            {"uid": 7, "idx_o": 2, "idx_d": 3,
+             "x_o": 2, "y_o": 0, "z_o": -2, "x_d": 3, "y_d": 0, "z_d": -3,
+             "time_d": 10.0, "dist_d": 100.0, "velocity_d": 36.0},
+        ])
+
+        row = LabelPath.effective_segment_row(traj_df, 0, {(7, 1)})
+
+        self.assertEqual((row["x_o"], row["x_d"], row["idx_d"]), (0, 2, 2))
+        self.assertEqual(row["time_d"], 30.0)
+        self.assertEqual(row["dist_d"], 500.0)
+        self.assertAlmostEqual(row["velocity_d"], 60.0)
+
+    def test_ignore_point_removes_two_adjacent_labels_without_archive(self):
+        traj_df = pd.DataFrame([
+            {"uid": 7, "idx_o": 0},
+            {"uid": 7, "idx_o": 1},
+            {"uid": 7, "idx_o": 2},
+        ])
+        output_dir = LabelPath.os.path.join(
+            LabelPath.os.getcwd(), "tests", "_runtime_ignore_output",
+        )
+        artifact_names = (
+            "traj_labeled.csv",
+            LabelPath.IGNORED_POINT_FILENAME,
+        )
+        for name in artifact_names:
+            path = LabelPath.os.path.join(output_dir, name)
+            if LabelPath.os.path.exists(path):
+                LabelPath.os.remove(path)
+        try:
+            active_path = LabelPath.os.path.join(output_dir, "traj_labeled.csv")
+            pd.DataFrame([
+                {"uid": 7, "idx_o": 0, "mode": "TG"},
+                {"uid": 7, "idx_o": 1, "mode": "TS"},
+                {"uid": 7, "idx_o": 2, "mode": "GG"},
+            ]).to_csv(active_path, index=False)
+
+            renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+            renderer.traj_df = traj_df
+            renderer.output_dir = output_dir
+            renderer.ignored_points = set()
+            renderer.labeled_modes = {(7, 0): "TG", (7, 1): "TS", (7, 2): "GG"}
+            renderer._uid_segment_positions = {7: np.asarray([0, 1, 2])}
+            renderer._uid_resolved_counts = {7: 3}
+            renderer.current_idx = 2
+            renderer.segment_select_callback = mock.Mock()
+            renderer.refresh_uid_segment_list = mock.Mock()
+
+            renderer._toggle_ignored_point(1)
+
+            self.assertEqual(renderer.ignored_points, {(7, 1)})
+            self.assertEqual(renderer.labeled_modes, {(7, 2): "GG"})
+            self.assertEqual(
+                set(pd.read_csv(active_path)["idx_o"].tolist()), {2},
+            )
+            self.assertFalse(LabelPath.os.path.exists(
+                LabelPath.os.path.join(
+                    output_dir, "traj_labeled_invalidated.csv",
+                ),
+            ))
+            self.assertEqual(LabelPath.load_ignored_points(output_dir), {(7, 1)})
+
+            # A merged A->C label made while B is ignored also becomes stale
+            # when B is restored, so it must leave the active CSV as well.
+            active = pd.read_csv(active_path)
+            active = pd.concat([
+                active,
+                pd.DataFrame([{"uid": 7, "idx_o": 0, "mode": "BR"}]),
+            ], ignore_index=True)
+            active.to_csv(active_path, index=False)
+            renderer.labeled_modes[(7, 0)] = "BR"
+
+            renderer._toggle_ignored_point(1)
+            self.assertEqual(renderer.ignored_points, set())
+            self.assertEqual(renderer.labeled_modes, {(7, 2): "GG"})
+            self.assertEqual(LabelPath.load_ignored_points(output_dir), set())
+            self.assertEqual(pd.read_csv(active_path)["idx_o"].tolist(), [2])
+        finally:
+            for name in artifact_names:
+                path = LabelPath.os.path.join(output_dir, name)
+                if LabelPath.os.path.exists(path):
+                    LabelPath.os.remove(path)
+
+    def test_normalize_storage_sorts_active_records(self):
+        output_dir = LabelPath.os.path.join(
+            LabelPath.os.getcwd(), "tests", "_runtime_ignore_output",
+        )
+        active_path = LabelPath.os.path.join(output_dir, "traj_labeled.csv")
+        try:
+            pd.DataFrame([
+                {"uid": 7, "idx_o": 1, "idx_d": 2, "mode": "TS"},
+                {"uid": 7, "idx_o": 0, "idx_d": 1, "mode": "TG"},
+                {"uid": 6, "idx_o": 9, "idx_d": 10, "mode": "GG"},
+            ]).to_csv(active_path, index=False)
+
+            reordered = LabelPath.normalize_label_storage(output_dir)
+
+            self.assertEqual(reordered, 1)
+            active = pd.read_csv(active_path)
+            self.assertEqual(
+                list(active[["uid", "idx_o", "idx_d"]].itertuples(
+                    index=False, name=None,
+                )),
+                [(6, 9, 10), (7, 0, 1), (7, 1, 2)],
+            )
+        finally:
+            if LabelPath.os.path.exists(active_path):
+                LabelPath.os.remove(active_path)
+
     def test_saved_point_colors_match_road_overlay_colors(self):
         for mode, color in LabelPath.MODE_COLORS.items():
             self.assertEqual(LabelPath.LABELED_POINT_COLORS[mode], color)
@@ -212,6 +353,7 @@ class LabelFeedbackTest(unittest.TestCase):
         renderer.state = mock.Mock(uid=7)
         renderer.current_idx = 3
         renderer.labeled_modes = {(7, 1): "TG", (7, 5): "GG"}
+        renderer.ignored_points = {(7, 4)}
         renderer._uid_segment_positions = {7: np.arange(8, dtype=np.int32)}
         renderer._uid_list_uid = None
         renderer._uid_list_offset = 0
@@ -230,6 +372,8 @@ class LabelFeedbackTest(unittest.TestCase):
                             for color in rendered_colors))
         self.assertTrue(any(patch.get_edgecolor()[2] > 0.7
                             for patch in renderer.ax_uid_list.patches))
+        self.assertTrue(any(text.get_text() == "忽略"
+                            for text in renderer.ax_uid_list.texts))
         self.assertEqual(len(renderer._uid_list_hit_rows), 8)
         plt.close(renderer.fig)
 
@@ -263,6 +407,12 @@ class LabelFeedbackTest(unittest.TestCase):
         ))
         renderer.segment_select_callback.assert_called_once_with(target)
         self.assertEqual(target, LabelPath.UID_LIST_SCROLL_STEP)
+
+        renderer._toggle_ignored_point = mock.Mock()
+        renderer._on_uid_list_click(mock.Mock(
+            inaxes=renderer.ax_uid_list, ydata=(y_min + y_max) / 2, button=3,
+        ))
+        renderer._toggle_ignored_point.assert_called_once_with(target)
         plt.close(renderer.fig)
 
     def test_uid_navigation_uses_solid_dot_only_for_completed_uid(self):
@@ -284,7 +434,7 @@ class LabelFeedbackTest(unittest.TestCase):
         }
         renderer._uid_nav_values = np.asarray([10, 20, 30])
         renderer._uid_nav_index = {10: 0, 20: 1, 30: 2}
-        renderer._uid_labeled_counts = {10: 2, 20: 1, 30: 0}
+        renderer._uid_resolved_counts = {10: 2, 20: 1, 30: 0}
         renderer._uid_nav_offset = 0
         renderer._uid_nav_hit_rows = []
 
@@ -313,7 +463,7 @@ class LabelFeedbackTest(unittest.TestCase):
         }
         renderer._uid_nav_values = np.arange(40, dtype=np.int64)
         renderer._uid_nav_index = {uid: uid for uid in range(40)}
-        renderer._uid_labeled_counts = {uid: 0 for uid in range(40)}
+        renderer._uid_resolved_counts = {uid: 0 for uid in range(40)}
         renderer._uid_nav_offset = 0
         renderer._uid_nav_hit_rows = []
         renderer.segment_select_callback = mock.Mock()
@@ -348,6 +498,23 @@ class LabelFeedbackTest(unittest.TestCase):
         finalize.assert_called_once_with("TG")
         navigate.assert_called_once_with(1)
         close.assert_not_called()
+
+    def test_ignored_current_point_cannot_be_labeled(self):
+        state = mock.Mock(
+            row=pd.Series({"uid": 7, "idx_o": 3}),
+            path_history=[(0, 0, 0)],
+        )
+        renderer = mock.Mock(ignored_points={(7, 3)})
+        controller = LabelPath.LabelController(
+            state, renderer, "unused", batch_mode=True, current_idx=4,
+            navigate_callback=mock.Mock(),
+        )
+
+        with mock.patch.object(controller, "_finalize") as finalize:
+            controller.save_mode("TG")
+
+        finalize.assert_not_called()
+        controller.navigate_callback.assert_not_called()
 
     def test_enter_no_longer_starts_or_saves_a_label(self):
         state = mock.Mock(path_history=[(0, 0, 0)])
