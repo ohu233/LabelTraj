@@ -106,6 +106,42 @@ class LabelFeedbackTest(unittest.TestCase):
         self.assertIn("UID OD:   2 / 3", renderer.ax.texts[-1].get_text())
         plt.close(renderer.fig)
 
+    def test_road_buttons_toggle_layer_without_rescaling_and_persist_on_redraw(self):
+        renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+        renderer.fig, renderer.ax = plt.subplots()
+        renderer.road_visibility = {mode: True for mode in LabelPath.MODE_LIST}
+        renderer._road_artists = {}
+        renderer._road_buttons = {}
+        renderer._init_road_toggle_buttons()
+
+        renderer.ax.set_xlim(10, 20)
+        renderer.ax.set_ylim(30, 40)
+        artist = renderer.ax.scatter([15], [35])
+        renderer._road_artists["TG"] = artist
+        before = (renderer.ax.get_xlim(), renderer.ax.get_ylim())
+
+        renderer._toggle_road_layer("TG")
+
+        self.assertFalse(renderer.road_visibility["TG"])
+        self.assertFalse(artist.get_visible())
+        self.assertIn("关", renderer._road_buttons["TG"].label.get_text())
+        self.assertEqual((renderer.ax.get_xlim(), renderer.ax.get_ylim()), before)
+
+        renderer._road_artists = {}
+        renderer._road_display = {
+            "TG": (
+                np.asarray([15.0]), np.asarray([35.0]),
+                np.asarray([15.0]), np.asarray([35.0]),
+            ),
+        }
+        renderer._mx_min, renderer._mx_max = 10, 20
+        renderer._my_min, renderer._my_max = 30, 40
+        renderer._build_hex_road_overlay(None)
+
+        self.assertFalse(renderer._road_artists["TG"].get_visible())
+        self.assertEqual((renderer.ax.get_xlim(), renderer.ax.get_ylim()), before)
+        plt.close(renderer.fig)
+
     def test_batch_controller_navigates_without_closing_window(self):
         state = mock.Mock(path_history=[(0, 0, 0)])
         renderer = mock.Mock()

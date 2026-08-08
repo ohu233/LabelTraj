@@ -20,6 +20,7 @@ import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from matplotlib.widgets import Button
 
 # 禁用 matplotlib 默认快捷键，避免与标注操作冲突
 matplotlib.rcParams["keymap.quit"] = []
@@ -429,6 +430,9 @@ class PathRenderer:
         self.labeled_modes = labeled_modes if labeled_modes is not None else {}
         self.pois = pois or []
         self.pois_by_hex = group_pois_by_hex(self.pois)
+        self.road_visibility = {mode: True for mode in MODE_LIST}
+        self._road_artists = {}
+        self._road_buttons = {}
         self._prepare_static_indexes()
 
         # 左右分栏：左侧地图，右侧速度分布
@@ -439,6 +443,10 @@ class PathRenderer:
         self.fig.canvas.manager.set_window_title("LabelPath — Hex Grid")
         self.fig.canvas.mpl_connect("motion_notify_event", self._on_poi_hover)
         self.show_segment(state, current_idx, initial=True)
+        self._init_road_toggle_buttons()
+        # Reserve a clear band between the x-axis labels and the bottom controls.
+        self.fig.subplots_adjust(bottom=0.145)
+        self.fig.canvas.draw_idle()
 
     def _prepare_static_indexes(self):
         """Project and index immutable layers once for the whole annotation run."""
@@ -489,6 +497,7 @@ class PathRenderer:
         self.current_idx = current_idx
         self._poi_scatter_meta = []
         self._poi_hover = None
+        self._road_artists = {}
         self.ax.clear()
 
         self._init_hex_view(state, self.raw_mapdata)
@@ -529,6 +538,66 @@ class PathRenderer:
                 )
                 self.fig.tight_layout()
         self.fig.canvas.draw_idle()
+
+    def _init_road_toggle_buttons(self):
+        """Create persistent bottom buttons for the five road-network layers."""
+        button_width = 0.135
+        button_gap = 0.012
+        button_height = 0.042
+        total_width = len(MODE_LIST) * button_width + (len(MODE_LIST) - 1) * button_gap
+        left = (1.0 - total_width) / 2.0
+
+        for index, mode_name in enumerate(MODE_LIST):
+            button_ax = self.fig.add_axes([
+                left + index * (button_width + button_gap),
+                0.018,
+                button_width,
+                button_height,
+            ])
+            button = Button(button_ax, "")
+            button.label.set_fontsize(8)
+            button.label.set_fontweight("bold")
+            button.on_clicked(
+                lambda _event, selected_mode=mode_name: self._toggle_road_layer(selected_mode)
+            )
+            self._road_buttons[mode_name] = button
+            self._update_road_button_style(mode_name)
+
+    def _toggle_road_layer(self, mode_name):
+        """Toggle one road layer without redrawing or changing the viewport."""
+        is_visible = not self.road_visibility.get(mode_name, True)
+        self.road_visibility[mode_name] = is_visible
+        artist = self._road_artists.get(mode_name)
+        if artist is not None:
+            artist.set_visible(is_visible)
+        self._update_road_button_style(mode_name)
+        self.fig.canvas.draw_idle()
+
+    def _update_road_button_style(self, mode_name):
+        button = self._road_buttons.get(mode_name)
+        if button is None:
+            return
+
+        is_visible = self.road_visibility.get(mode_name, True)
+        label = MODE_LABELS.get(mode_name, mode_name)
+        button.label.set_text(f"{mode_name} {label}  {'开' if is_visible else '关'}")
+        if is_visible:
+            color = MODE_COLORS.get(mode_name, (0.5, 0.5, 0.5))
+            hover_color = tuple(min(channel + 0.16, 1.0) for channel in color)
+            text_color = "white"
+            edge_color = "#303030"
+        else:
+            color = "#d4d4d4"
+            hover_color = "#e5e5e5"
+            text_color = "#555555"
+            edge_color = "#909090"
+
+        button.color = color
+        button.hovercolor = hover_color
+        button.ax.set_facecolor(color)
+        button.ax.patch.set_edgecolor(edge_color)
+        button.ax.patch.set_linewidth(1.2)
+        button.label.set_color(text_color)
 
     # ======================== Hex View Init ========================
 
@@ -766,11 +835,13 @@ class PathRenderer:
                 if not visible.any():
                     continue
                 color = MODE_COLORS.get(mode_name, (0.5, 0.5, 0.5))
-                self.ax.scatter(
+                artist = self.ax.scatter(
                     gx[visible], gy[visible],
                     c=[color], s=6, alpha=ROAD_OVERLAY_ALPHA,
                     marker="h", zorder=2, label=mode_name,
                 )
+                artist.set_visible(self.road_visibility.get(mode_name, True))
+                self._road_artists[mode_name] = artist
             return
 
         # 视口 Mercator 四角 → WGS84 → 近似 hex 坐标范围
@@ -809,11 +880,13 @@ class PathRenderer:
             if mx_list:
                 r, g, b = MODE_COLORS.get(mode_name, (0.5, 0.5, 0.5))
                 gx, gy = mercator_wgs84_to_gcj02(mx_list, my_list)
-                self.ax.scatter(
+                artist = self.ax.scatter(
                     gx, gy,
                     c=[(r, g, b)], s=6, alpha=ROAD_OVERLAY_ALPHA,
                     marker='h', zorder=2, label=mode_name,
                 )
+                artist.set_visible(self.road_visibility.get(mode_name, True))
+                self._road_artists[mode_name] = artist
 
     def _draw_osm_pois(self):
         """Draw cached OSM stations/toll points inside the current viewport."""
