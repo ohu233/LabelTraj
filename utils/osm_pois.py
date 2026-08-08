@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -50,6 +51,20 @@ CATEGORY_ORDER = {
 # The point must actually fall in/very near its nearest 200 m hex.  This keeps
 # points in the bounding rectangle but outside the irregular hex coverage out.
 MAX_HEX_CENTER_DISTANCE_METERS = 350.0
+
+# ``railway=station`` also covers freight and operating facilities in OSM.
+# The annotation layer is intended to show places where a passenger may board
+# a train, so obvious non-passenger facilities are excluded even when their
+# mode tags are noisy.
+NON_PASSENGER_RAIL_NAME_RE = re.compile(
+    r"油库|卸油|煤矿|铜矿|(?<!大学)矿$|车辆基地|车辆段|动车所|机务段|"
+    r"编组场|货运|货场|线路所|信号场|会让站|越行站|工业站$",
+    re.IGNORECASE,
+)
+INACTIVE_RAIL_NAME_RE = re.compile(
+    r"在建|待建|规划(?:中)?|废弃|停运|关闭|已拆|建设中",
+    re.IGNORECASE,
+)
 
 
 def load_hex_bounds(cache_path=os.path.join("data", "hex_cache.npz")):
@@ -118,7 +133,7 @@ def classify_tags(tags):
         and landuse != "construction"
         and str(tags.get("disused", "")).lower() != "yes"
         and str(tags.get("abandoned", "")).lower() != "yes"
-        and "在建" not in name
+        and not INACTIVE_RAIL_NAME_RE.search(name)
     )
 
     is_rail_stop = railway in {"station", "halt"}
@@ -128,13 +143,20 @@ def classify_tags(tags):
     if is_subway:
         categories.append(CATEGORY_SUBWAY)
 
-    excluded_station_types = {"subway", "light_rail", "monorail", "tram"}
-    is_train = rail_is_active and is_rail_stop and (
-        train == "yes"
-        or (
-            station not in excluded_station_types
-            and subway != "yes"
-            and train != "no"
+    non_train_station_types = {"light_rail", "monorail", "tram"}
+    explicit_train = train == "yes"
+    passenger_station = public_transport == "station" and train != "no"
+    obvious_non_passenger = bool(NON_PASSENGER_RAIL_NAME_RE.search(name))
+    is_train = (
+        rail_is_active
+        and is_rail_stop
+        and station not in non_train_station_types
+        and not obvious_non_passenger
+        and (
+            explicit_train
+            # A metro-only station is not also a train station.  An interchange
+            # remains dual-classified when OSM explicitly says train=yes.
+            or (passenger_station and station != "subway" and subway != "yes")
         )
     )
     # A real train/metro interchange may intentionally appear in both layers.
@@ -186,13 +208,25 @@ def _normalize_name(name):
     return "".join(str(name).lower().split())
 
 
+def _normalize_station_name(name, category):
+    """Normalize harmless station suffix differences for spatial deduplication."""
+    normalized = _normalize_name(name)
+    if category in {CATEGORY_SUBWAY, CATEGORY_TRAIN}:
+        normalized = re.sub(
+            r"(?:铁路车站|火车站|railwaystation|trainstation|station|站)$",
+            "",
+            normalized,
+        )
+    return normalized
+
+
 def _collapse_nearby_named_records(records):
     """Collapse duplicate node/area representations of the same named place."""
     unnamed = _normalize_name(preferred_name({}))
     groups = defaultdict(list)
     passthrough = []
     for record in records:
-        normalized = _normalize_name(record["name"])
+        normalized = _normalize_station_name(record["name"], record["category"])
         if normalized == unnamed:
             passthrough.append(record)
         else:
@@ -280,7 +314,7 @@ def elements_to_records(elements, hex_grid=None, max_center_distance=MAX_HEX_CEN
     for record in records:
         key = (
             record["category"], record["hex_x"], record["hex_y"], record["hex_z"],
-            _normalize_name(record["name"]),
+            _normalize_station_name(record["name"], record["category"]),
         )
         previous = deduped.get(key)
         if previous is None or element_rank.get(record["osm_type"], 0) > element_rank.get(previous["osm_type"], 0):

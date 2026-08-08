@@ -95,9 +95,6 @@ DEFAULT_OUTPUT_DIR = "label_output"
 
 DISTANCE_THRESHOLD = 1.0
 
-# 前后参考段数（同一 uid 相邻段，用于绘制上下文 OD 链）
-CONTEXT_NEIGHBORS = 7
-
 # Label options after saving (press 1-6 to select)
 # 与路网渲染分组一致：TG/TS/DT/GG/GSD；6=Other
 LABEL_OPTIONS = {
@@ -215,6 +212,7 @@ def load_hex_mapdata(path=HEX_PKL_PATH):
 
 # 原始点级数据缓存，供速度分布图使用
 _RAW_POINT_DF = None
+_RAW_VELOCITIES_BY_UID = {}
 
 # 不保存轨迹开关（运行时按 N 切换）：开启后保存时 traj(路径)留空，其余字段照常写入
 _NO_TRAJ_MODE = True
@@ -224,6 +222,104 @@ def get_raw_point_df():
     return _RAW_POINT_DF
 
 
+def _build_segments_from_point_df(df, sample_step):
+    """Vectorized point-sequence to OD conversion.
+
+    The previous implementation iterated over every one of the 270k+ ODs with
+    ``group.iloc``.  This keeps the same sampling and interval-sum semantics,
+    but shifts sampled rows and cumulative sums in Pandas/NumPy.
+    """
+    if sample_step <= 0:
+        raise ValueError("sample_step must be positive")
+    if df.empty:
+        return pd.DataFrame()
+
+    uid_groups = df.groupby("uid", sort=False)
+    group_position = uid_groups.cumcount()
+    sampled_mask = (group_position % int(sample_step)) == 0
+    sampled = df.loc[sampled_mask].copy()
+    sampled["_group_position"] = group_position.loc[sampled_mask].to_numpy()
+    sampled_groups = sampled.groupby("uid", sort=False)
+    following = sampled_groups.shift(-1)
+    valid = following["hex_x"].notna()
+    if not valid.any():
+        return pd.DataFrame()
+
+    origin = sampled.loc[valid]
+    destination = following.loc[valid]
+
+    def _interval_sum(column):
+        if column not in df.columns:
+            return np.zeros(int(valid.sum()), dtype=float)
+        values = pd.to_numeric(df[column], errors="coerce").fillna(0.0)
+        cumulative = values.groupby(df["uid"], sort=False).cumsum()
+        sampled_cumulative = cumulative.loc[sampled.index]
+        next_cumulative = sampled_cumulative.groupby(sampled["uid"], sort=False).shift(-1)
+        return (next_cumulative - sampled_cumulative).loc[valid].to_numpy(dtype=float)
+
+    time_sum = _interval_sum("time_value")
+    dist_sum = _interval_sum("dist_value")
+    if "velocity" in destination.columns:
+        fallback_velocity = pd.to_numeric(
+            destination["velocity"], errors="coerce",
+        ).fillna(0.0).to_numpy(dtype=float)
+    else:
+        fallback_velocity = np.zeros(len(origin), dtype=float)
+    velocity_d = np.where(
+        (time_sum > 0) & (dist_sum > 0),
+        dist_sum / time_sum * 3.6,
+        fallback_velocity,
+    )
+
+    def _origin_values(column, default=0, dtype=None):
+        if column not in origin.columns:
+            return np.full(len(origin), default, dtype=dtype)
+        values = origin[column]
+        return values.to_numpy(dtype=dtype) if dtype is not None else values.to_numpy()
+
+    def _destination_values(column, default=0, dtype=None):
+        if column not in destination.columns:
+            return np.full(len(destination), default, dtype=dtype)
+        values = destination[column]
+        return values.to_numpy(dtype=dtype) if dtype is not None else values.to_numpy()
+
+    idx_o = (
+        _origin_values("idx", dtype=np.int64)
+        if "idx" in origin.columns
+        else _origin_values("_group_position", dtype=np.int64)
+    )
+    idx_d = (
+        _destination_values("idx", dtype=np.int64)
+        if "idx" in destination.columns
+        else _destination_values("_group_position", dtype=np.int64)
+    )
+    source_mode = (
+        origin["attribution"].astype(str).to_numpy()
+        if "attribution" in origin.columns
+        else np.full(len(origin), "ALL", dtype=object)
+    )
+
+    return pd.DataFrame({
+        "x_o": _origin_values("hex_x", dtype=np.int64),
+        "y_o": _origin_values("hex_y", dtype=np.int64),
+        "z_o": _origin_values("hex_z", dtype=np.int64),
+        "x_d": _destination_values("hex_x", dtype=np.int64),
+        "y_d": _destination_values("hex_y", dtype=np.int64),
+        "z_d": _destination_values("hex_z", dtype=np.int64),
+        "mode": source_mode,
+        "order": _origin_values("uid", dtype=np.int64),
+        "uid": _origin_values("uid", dtype=np.int64),
+        "idx_o": idx_o,
+        "idx_d": idx_d,
+        "stime_o": _origin_values("stime", dtype=np.int64),
+        "lat_o": _origin_values("lat", dtype=float),
+        "lon_o": _origin_values("lon", dtype=float),
+        "time_d": time_sum,
+        "dist_d": dist_sum,
+        "velocity_d": velocity_d,
+    })
+
+
 def load_traj_csv_hex(path, sample_step=10):
     """读取六边形模式轨迹 CSV，按 uid 分组生成起终点记录。
 
@@ -231,7 +327,7 @@ def load_traj_csv_hex(path, sample_step=10):
     1. 起终点格式: x_o,y_o,z_o,x_d,y_d,z_d,mode,order
     2. 点序列格式: uid,hex_x,hex_y,hex_z,...  → 按 uid 分组，每 sample_step 行采样生成段
     """
-    global _RAW_POINT_DF
+    global _RAW_POINT_DF, _RAW_VELOCITIES_BY_UID
     df = pd.read_csv(path)
     # 列名兼容: 不同数据集标识列命名不同，统一为 uid
     if "traj_id" in df.columns and "uid" not in df.columns:
@@ -246,40 +342,17 @@ def load_traj_csv_hex(path, sample_step=10):
     # 检测格式: 有 hex_x/hex_y/hex_z 列 → 点序列格式
     if "hex_x" in df.columns and "uid" in df.columns:
         _RAW_POINT_DF = df  # 缓存原始数据
-        records = []
-        for uid, group in df.groupby("uid", sort=False):
-            group = group.reset_index(drop=True)
-            sampled_indices = list(range(0, len(group), sample_step))
-            for i in range(len(sampled_indices) - 1):
-                a = group.iloc[sampled_indices[i]]
-                b = group.iloc[sampled_indices[i + 1]]
-                # 间隔取行：对区间内的 time / dist 求和，velocity 重算
-                seg_rows = group.iloc[sampled_indices[i] + 1 : sampled_indices[i + 1] + 1]
-                time_sum = float(seg_rows["time_value"].sum()) if "time_value" in df.columns else 0.0
-                dist_sum = float(seg_rows["dist_value"].sum()) if "dist_value" in df.columns else 0.0
-                if time_sum > 0 and dist_sum > 0:
-                    velocity_d = dist_sum / time_sum * 3.6  # m/s → km/h
-                elif "velocity" in df.columns:
-                    velocity_d = float(b["velocity"])
-                else:
-                    velocity_d = 0.0
-
-                records.append({
-                    "x_o": int(a["hex_x"]), "y_o": int(a["hex_y"]), "z_o": int(a["hex_z"]),
-                    "x_d": int(b["hex_x"]), "y_d": int(b["hex_y"]), "z_d": int(b["hex_z"]),
-                    "mode": str(a["attribution"]) if "attribution" in df.columns else "ALL",
-                    "order": int(uid),
-                    "uid": int(uid),
-                    "idx_o": int(a["idx"]) if "idx" in df.columns else int(a.name),
-                    "idx_d": int(b["idx"]) if "idx" in df.columns else int(b.name),
-                    "stime_o": int(a["stime"]) if "stime" in df.columns else 0,
-                    "lat_o": float(a["lat"]) if "lat" in df.columns else 0.0,
-                    "lon_o": float(a["lon"]) if "lon" in df.columns else 0.0,
-                    "time_d": time_sum,
-                    "dist_d": dist_sum,
-                    "velocity_d": velocity_d,
-                })
-        return pd.DataFrame(records)
+        if "velocity" in df.columns:
+            valid_velocity = pd.to_numeric(df["velocity"], errors="coerce").ge(0)
+            if "attribution" in df.columns:
+                valid_velocity &= df["attribution"].ne("origin")
+            _RAW_VELOCITIES_BY_UID = {
+                int(uid): group["velocity"].dropna().to_numpy(dtype=float)
+                for uid, group in df.loc[valid_velocity].groupby("uid", sort=False)
+            }
+        else:
+            _RAW_VELOCITIES_BY_UID = {}
+        return _build_segments_from_point_df(df, sample_step)
     return df
 
 
@@ -356,6 +429,7 @@ class PathRenderer:
         self.labeled_modes = labeled_modes if labeled_modes is not None else {}
         self.pois = pois or []
         self.pois_by_hex = group_pois_by_hex(self.pois)
+        self._prepare_static_indexes()
 
         # 左右分栏：左侧地图，右侧速度分布
         self.fig = plt.figure(figsize=(16, 9))
@@ -366,6 +440,49 @@ class PathRenderer:
         self.fig.canvas.mpl_connect("motion_notify_event", self._on_poi_hover)
         self.show_segment(state, current_idx, initial=True)
 
+    def _prepare_static_indexes(self):
+        """Project and index immutable layers once for the whole annotation run."""
+        self._road_display = {}
+        if self.road_sets:
+            for mode_name in MODE_LIST:
+                road_set = self.road_sets.get(mode_name)
+                if not road_set:
+                    continue
+                coordinates = np.asarray(tuple(road_set), dtype=np.int32)
+                mx, my = hex_to_mercator(
+                    coordinates[:, 0], coordinates[:, 1], coordinates[:, 2],
+                )
+                gx, gy = mercator_wgs84_to_gcj02(mx, my)
+                self._road_display[mode_name] = (
+                    np.asarray(mx), np.asarray(my), np.asarray(gx), np.asarray(gy),
+                )
+
+        self._poi_index = {}
+        for category in POI_STYLES:
+            records = [record for record in self.pois if record["category"] == category]
+            if not records:
+                continue
+            self._poi_index[category] = (
+                records,
+                np.fromiter((record["_mercator_x"] for record in records), dtype=float),
+                np.fromiter((record["_mercator_y"] for record in records), dtype=float),
+            )
+
+        self._uid_od_current = None
+        self._uid_od_total = None
+        if self.traj_df is not None and "uid" in self.traj_df.columns:
+            uid_values = pd.to_numeric(self.traj_df["uid"], errors="coerce")
+            grouped = uid_values.groupby(uid_values, sort=False)
+            self._uid_od_current = (grouped.cumcount() + 1).to_numpy(dtype=np.int32)
+            self._uid_od_total = grouped.transform("size").to_numpy(dtype=np.int32)
+            self._uid_segment_positions = {
+                int(uid): np.asarray(positions, dtype=np.int32)
+                for uid, positions in grouped.indices.items()
+                if not pd.isna(uid)
+            }
+        else:
+            self._uid_segment_positions = {}
+
     def show_segment(self, state, current_idx, initial=False):
         """Render another OD in the existing figure instead of reopening it."""
         self.state = state
@@ -373,7 +490,6 @@ class PathRenderer:
         self._poi_scatter_meta = []
         self._poi_hover = None
         self.ax.clear()
-        self.ax_hist.clear()
 
         self._init_hex_view(state, self.raw_mapdata)
 
@@ -395,7 +511,7 @@ class PathRenderer:
                 label=style["label"],
             )
             for category, style in POI_STYLES.items()
-            if any(record["category"] == category for record in self.pois)
+            if category in self._poi_index
         ]
         self.ax.legend(
             handles=mode_handles + poi_handles, loc="lower right",
@@ -502,107 +618,131 @@ class PathRenderer:
         self._draw_velocity_hist(state)
 
     def _draw_context_points(self, state):
-        """绘制同一 uid 前后若干段的参考点，并用灰色虚线顺序连接。
+        """绘制同一 UID 中落在当前视口内的全部前后参考点。
 
-        OD 链按时间顺序排列：
-          [前n起点, ..., 前1起点, 当前起点, 当前终点, 下1终点, ..., 下n终点]
-        - 已标注参考段使用对应路网颜色，未标注前/后段分别使用黄/蓝色；
-        - 完整保留前后窗口内的参考点，便于判断轨迹走向。
+        视口只由当前 OD 起终点决定。上下文先按完整 UID 轨迹投影，再按
+        已有坐标轴范围裁剪；绘制完成后显式恢复范围，保证参考点永远不会
+        触发缩放。
         """
         if self.traj_df is None or self.current_idx is None:
             return
 
         traj_df = self.traj_df
         idx = self.current_idx
+        positions_by_uid = getattr(self, "_uid_segment_positions", None)
+        if positions_by_uid is None:
+            uid_values = pd.to_numeric(traj_df["uid"], errors="coerce")
+            grouped = uid_values.groupby(uid_values, sort=False)
+            positions_by_uid = {
+                int(uid): np.asarray(positions, dtype=np.int32)
+                for uid, positions in grouped.indices.items()
+                if not pd.isna(uid)
+            }
+            self._uid_segment_positions = positions_by_uid
+        uid_positions = positions_by_uid.get(state.uid, np.empty(0, dtype=np.int32))
+        previous_positions = uid_positions[uid_positions < idx]
+        next_positions = uid_positions[uid_positions > idx]
 
-        def _proj(xyz):
-            mx, my = hex_to_mercator(*xyz)
-            mx, my = mercator_wgs84_to_gcj02(mx, my)
-            return (float(mx), float(my))
+        def _project_rows(positions, prefix):
+            if not len(positions):
+                return np.empty(0), np.empty(0)
+            rows = traj_df.iloc[positions]
+            mx, my = hex_to_mercator(
+                rows[f"x_{prefix}"].to_numpy(dtype=np.int64),
+                rows[f"y_{prefix}"].to_numpy(dtype=np.int64),
+                rows[f"z_{prefix}"].to_numpy(dtype=np.int64),
+            )
+            gx, gy = mercator_wgs84_to_gcj02(mx, my)
+            return np.asarray(gx), np.asarray(gy)
 
-        # ---- 前段 OD 链（远→近）：[前n起点, ..., 前1起点, 当前起点] ----
-        front_items = [(idx, (int(state.start[0]), int(state.start[1]), int(state.start[2])))]
-        for i in range(idx - 1, max(idx - CONTEXT_NEIGHBORS - 1, -1), -1):
-            row_i = traj_df.iloc[i]
-            if int(row_i.get("uid", -1)) != state.uid:
-                break
-            front_items.insert(0, (
-                i, (int(row_i["x_o"]), int(row_i["y_o"]), int(row_i["z_o"])),
-            ))
+        prev_x, prev_y = _project_rows(previous_positions, "o")
+        next_x, next_y = _project_rows(next_positions, "d")
+        start_x, start_y = hex_to_mercator(*state.start)
+        start_x, start_y = mercator_wgs84_to_gcj02(start_x, start_y)
+        end_x, end_y = hex_to_mercator(*state.end)
+        end_x, end_y = mercator_wgs84_to_gcj02(end_x, end_y)
 
-        # ---- 后段 OD 链：[当前终点, 下1终点, ..., 下n终点] ----
-        back_items = [(idx, (int(state.end[0]), int(state.end[1]), int(state.end[2])))]
-        for i in range(idx + 1, min(idx + CONTEXT_NEIGHBORS + 1, len(traj_df))):
-            row_i = traj_df.iloc[i]
-            if int(row_i.get("uid", -1)) != state.uid:
-                break
-            back_items.append((
-                i, (int(row_i["x_d"]), int(row_i["y_d"]), int(row_i["z_d"])),
-            ))
+        x_limits = self.ax.get_xlim()
+        y_limits = self.ax.get_ylim()
+        x_min, x_max = sorted(x_limits)
+        y_min, y_max = sorted(y_limits)
 
-        front_chain = [_proj(item[1]) for item in front_items]  # 末尾为当前起点
-        back_chain = [_proj(item[1]) for item in back_items]     # 起点为当前终点
-
-        # ---- 灰色虚线顺序连接 ----
-        for chain in (front_chain, back_chain):
-            if len(chain) >= 2:
-                xs = [p[0] for p in chain]
-                ys = [p[1] for p in chain]
+        # 完整轨迹链交给 Matplotlib 视口裁剪；参考点只提交视口内的部分。
+        for chain_x, chain_y in (
+            (np.append(prev_x, float(start_x)), np.append(prev_y, float(start_y))),
+            (np.insert(next_x, 0, float(end_x)), np.insert(next_y, 0, float(end_y))),
+        ):
+            if len(chain_x) >= 2:
                 self.ax.plot(
-                    xs, ys, "--",
+                    chain_x, chain_y, "--",
                     color="dimgray", linewidth=1.0,
-                    alpha=0.58, zorder=5.6,
+                    alpha=0.58, zorder=5.6, scalex=False, scaley=False,
                 )
-
-        # ---- 参考点（不含当前段起止点，它们由 start/end_handle 负责）----
-        prev_pts = list(zip(front_items[:-1], front_chain[:-1]))
-        next_pts = list(zip(back_items[1:], back_chain[1:]))
 
         def _saved_color(row_idx, fallback):
             row_i = traj_df.iloc[row_idx]
             mode = self.labeled_modes.get(_annotation_key(row_i))
             return LABELED_POINT_COLORS.get(mode, fallback)
 
-        for pos, ((row_idx, _), (px, py)) in enumerate(prev_pts):
-            is_near = pos == len(prev_pts) - 1
-            self.ax.scatter(
-                [px], [py],
-                c=[_saved_color(row_idx, "#d8a24a")], marker="D",
-                s=42 if is_near else 28,
-                edgecolors="#7a4b00", linewidths=1.4 if is_near else 0.9,
-                alpha=CONTEXT_ALPHA,
-                zorder=7.2 if is_near else 6.6,
+        def _draw_visible(positions, xs, ys, fallback, edge, near_position, near_size):
+            if not len(positions):
+                return
+            visible = (
+                (xs >= x_min) & (xs <= x_max)
+                & (ys >= y_min) & (ys <= y_max)
             )
-        for pos, ((row_idx, _), (px, py)) in enumerate(next_pts):
-            is_near = pos == 0
-            self.ax.scatter(
-                [px], [py],
-                c=[_saved_color(row_idx, "deepskyblue")], marker="D",
-                s=46 if is_near else 28,
-                edgecolors="#005bbb", linewidths=1.6 if is_near else 0.9,
-                alpha=CONTEXT_ALPHA,
-                zorder=7.3 if is_near else 6.6,
-            )
+            near = visible & (positions == near_position)
+            far = visible & ~near
+            if far.any():
+                far_positions = positions[far]
+                self.ax.scatter(
+                    xs[far], ys[far],
+                    c=[_saved_color(int(row_idx), fallback) for row_idx in far_positions],
+                    marker="D", s=28, edgecolors=edge, linewidths=0.9,
+                    alpha=CONTEXT_ALPHA, zorder=6.6,
+                )
+            if near.any():
+                near_index = int(np.flatnonzero(near)[0])
+                row_idx = int(positions[near_index])
+                self.ax.scatter(
+                    [xs[near_index]], [ys[near_index]],
+                    c=[_saved_color(row_idx, fallback)], marker="D",
+                    s=near_size, edgecolors=edge, linewidths=1.5,
+                    alpha=CONTEXT_ALPHA, zorder=7.25,
+                )
+
+        nearest_previous = int(previous_positions[-1]) if len(previous_positions) else -1
+        nearest_next = int(next_positions[0]) if len(next_positions) else -1
+        _draw_visible(
+            previous_positions, prev_x, prev_y,
+            "#d8a24a", "#7a4b00", nearest_previous, 42,
+        )
+        _draw_visible(
+            next_positions, next_x, next_y,
+            "deepskyblue", "#005bbb", nearest_next, 46,
+        )
+
+        # 明确恢复，防止任何新增 artist 改变当前 OD 的视图范围。
+        self.ax.set_xlim(x_limits)
+        self.ax.set_ylim(y_limits)
 
     def _draw_velocity_hist(self, state):
         """在右侧子图绘制当前 uid 的速度分布直方图"""
-        raw = get_raw_point_df()
-        if raw is None or self.ax_hist is None:
+        if self.ax_hist is None:
             return
-        uid_mask = raw["uid"] == state.uid
-        if "attribution" in raw.columns:
-            uid_mask &= raw["attribution"] != "origin"
-        uid_data = raw[uid_mask]
-        velocities = uid_data["velocity"].dropna()
-        velocities = velocities[velocities >= 0]
+        if getattr(self, "_hist_uid", None) == state.uid:
+            return
+        self._hist_uid = state.uid
+        velocities = _RAW_VELOCITIES_BY_UID.get(state.uid, np.empty(0, dtype=float))
 
         self.ax_hist.clear()
         if len(velocities) > 0:
             self.ax_hist.hist(velocities, bins=25, color="steelblue",
                               edgecolor="white", alpha=0.85)
-            self.ax_hist.axvline(velocities.median(), color="red", ls="--", lw=1.2,
-                                 label=f'median={velocities.median():.1f}')
-            mean_v = velocities.mean()
+            median_v = float(np.median(velocities))
+            self.ax_hist.axvline(median_v, color="red", ls="--", lw=1.2,
+                                 label=f'median={median_v:.1f}')
+            mean_v = float(np.mean(velocities))
             self.ax_hist.axvline(mean_v, color="orange", ls="--", lw=1.2,
                                  label=f'mean={mean_v:.1f}')
             self.ax_hist.legend(fontsize=7, loc="upper right")
@@ -613,6 +753,26 @@ class PathRenderer:
 
     def _build_hex_road_overlay(self, hex_grid):
         """六边形模式道路叠加层 —— 视口范围内的散点图（按 6 分组配色）"""
+        if self._road_display:
+            for mode_name in MODE_LIST:
+                projected = self._road_display.get(mode_name)
+                if projected is None:
+                    continue
+                mx, my, gx, gy = projected
+                visible = (
+                    (mx >= self._mx_min) & (mx <= self._mx_max)
+                    & (my >= self._my_min) & (my <= self._my_max)
+                )
+                if not visible.any():
+                    continue
+                color = MODE_COLORS.get(mode_name, (0.5, 0.5, 0.5))
+                self.ax.scatter(
+                    gx[visible], gy[visible],
+                    c=[color], s=6, alpha=ROAD_OVERLAY_ALPHA,
+                    marker="h", zorder=2, label=mode_name,
+                )
+            return
+
         # 视口 Mercator 四角 → WGS84 → 近似 hex 坐标范围
         from utils.geo_utils import _merc_to_wgs84
         corners_mx = [self._mx_min, self._mx_max, self._mx_max, self._mx_min]
@@ -657,16 +817,24 @@ class PathRenderer:
 
     def _draw_osm_pois(self):
         """Draw cached OSM stations/toll points inside the current viewport."""
-        visible = [
-            record for record in self.pois
-            if self._mx_min <= record["_mercator_x"] <= self._mx_max
-            and self._my_min <= record["_mercator_y"] <= self._my_max
-        ]
+        visible = []
+        visible_by_category = {}
+        for category, (records, mx, my) in self._poi_index.items():
+            mask = (
+                (mx >= self._mx_min) & (mx <= self._mx_max)
+                & (my >= self._my_min) & (my <= self._my_max)
+            )
+            indices = np.flatnonzero(mask)
+            if not len(indices):
+                continue
+            category_records = [records[int(index)] for index in indices]
+            visible_by_category[category] = category_records
+            visible.extend(category_records)
         if not visible:
             return
 
         for category, style in POI_STYLES.items():
-            category_records = [record for record in visible if record["category"] == category]
+            category_records = visible_by_category.get(category, [])
             if not category_records:
                 continue
             xs = [record["_display_x"] for record in category_records]
@@ -806,19 +974,25 @@ class PathRenderer:
 
     def _uid_od_progress(self):
         """Return the current OD's 1-based position and total within this UID."""
-        if self.traj_df is None or self.current_idx is None:
+        if self.current_idx is None:
             return None, None
-        if "uid" not in self.traj_df.columns:
+        current_values = getattr(self, "_uid_od_current", None)
+        total_values = getattr(self, "_uid_od_total", None)
+        if current_values is None or total_values is None:
+            if self.traj_df is None or "uid" not in self.traj_df.columns:
+                return None, None
+            uid_values = pd.to_numeric(self.traj_df["uid"], errors="coerce")
+            grouped = uid_values.groupby(uid_values, sort=False)
+            current_values = (grouped.cumcount() + 1).to_numpy(dtype=np.int32)
+            total_values = grouped.transform("size").to_numpy(dtype=np.int32)
+            self._uid_od_current = current_values
+            self._uid_od_total = total_values
+        if not 0 <= self.current_idx < len(current_values):
             return None, None
-        if not 0 <= self.current_idx < len(self.traj_df):
-            return None, None
-
-        uid_values = pd.to_numeric(self.traj_df["uid"], errors="coerce").to_numpy()
-        positions = np.flatnonzero(uid_values == self.state.uid)
-        current = np.flatnonzero(positions == self.current_idx)
-        if len(current) != 1:
-            return None, None
-        return int(current[0]) + 1, int(len(positions))
+        return (
+            int(current_values[self.current_idx]),
+            int(total_values[self.current_idx]),
+        )
 
     def _init_cell_info(self):
         """左下角：当前光标所在栅格的道路属性信息框（栅格可能复合多种道路）。"""
@@ -1239,10 +1413,12 @@ def main():
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             print(f"  [WARN] Failed to load OSM POI cache: {exc}")
 
+    # 匹配率基于所有可见路网分组的并集（不再按行内 mode 过滤）。
+    # 该集合对所有 OD 都相同，只构建一次，避免每次切换重复复制大集合。
+    multi_mapdata = set().union(*road_sets.values()) if road_sets else set()
+
     def make_state(row):
-        # 匹配率基于所有可见路网分组的并集（不再按行内 mode 过滤）
-        multi = set().union(*road_sets.values()) if road_sets else set()
-        return LabelState(row, multi, hex_grid=raw_mapdata)
+        return LabelState(row, multi_mapdata, hex_grid=raw_mapdata)
 
     output_dir = args.output
     labeled_modes = load_labeled_modes(output_dir)

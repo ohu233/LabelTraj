@@ -2,6 +2,7 @@ import unittest
 from unittest import mock
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 import LabelPath
@@ -38,6 +39,8 @@ class LabelFeedbackTest(unittest.TestCase):
         state = mock.Mock(uid=7, start=(2, 0, -2), end=(3, 0, -3))
         renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
         renderer.fig, renderer.ax = plt.subplots()
+        renderer.ax.set_xlim(-1, 5)
+        renderer.ax.set_ylim(-1, 1)
         renderer.traj_df = traj_df
         renderer.current_idx = 2
         renderer.labeled_modes = {
@@ -51,12 +54,40 @@ class LabelFeedbackTest(unittest.TestCase):
         collections = renderer.ax.collections
         self.assertEqual(len(collections), 4)
         self.assertTrue(all(c.get_alpha() == LabelPath.CONTEXT_ALPHA for c in collections))
-        self.assertTrue(
-            (collections[1].get_facecolors()[0, :3] == LabelPath.MODE_COLORS["TS"]).all()
-        )
-        self.assertTrue(
-            (collections[2].get_facecolors()[0, :3] == LabelPath.MODE_COLORS["GG"]).all()
-        )
+        rendered_colors = [
+            color[:3]
+            for collection in collections
+            for color in collection.get_facecolors()
+        ]
+        self.assertTrue(any(np.allclose(color, LabelPath.MODE_COLORS["TS"])
+                            for color in rendered_colors))
+        self.assertTrue(any(np.allclose(color, LabelPath.MODE_COLORS["GG"])
+                            for color in rendered_colors))
+        plt.close(renderer.fig)
+
+    def test_context_draws_all_visible_uid_points_without_rescaling(self):
+        traj_df = pd.DataFrame([
+            {"uid": 7, "idx_o": i, "x_o": i, "y_o": 0, "z_o": -i,
+             "x_d": i + 1, "y_d": 0, "z_d": -(i + 1)}
+            for i in range(25)
+        ])
+        state = mock.Mock(uid=7, start=(12, 0, -12), end=(13, 0, -13))
+        renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+        renderer.fig, renderer.ax = plt.subplots()
+        renderer.ax.set_xlim(0, 25)
+        renderer.ax.set_ylim(-1, 1)
+        renderer.traj_df = traj_df
+        renderer.current_idx = 12
+        renderer.labeled_modes = {}
+        before = (renderer.ax.get_xlim(), renderer.ax.get_ylim())
+
+        with mock.patch.object(LabelPath, "hex_to_mercator", side_effect=lambda x, y, z: (x, y)), \
+             mock.patch.object(LabelPath, "mercator_wgs84_to_gcj02", side_effect=lambda x, y: (x, y)):
+            renderer._draw_context_points(state)
+
+        visible_points = sum(len(collection.get_offsets()) for collection in renderer.ax.collections)
+        self.assertEqual(visible_points, 24)
+        self.assertEqual((renderer.ax.get_xlim(), renderer.ax.get_ylim()), before)
         plt.close(renderer.fig)
 
     def test_segment_info_shows_uid_od_progress(self):

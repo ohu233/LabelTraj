@@ -412,24 +412,37 @@ def hex_to_wgs84(x, y, z):
                 return float(clo), float(_HEX_LAT[ix, iz])
         lon, lat = _affine_xyz_to_lonlat(x, y, z)
         return float(lon), float(lat)
-    n = xa.shape[0]
-    yi = np.asarray(y)
-    zi = np.asarray(z)
-    lon = np.empty(n, dtype=float)
-    lat = np.empty(n, dtype=float)
-    for i in range(n):
-        ix = int(xa[i]) - _HEX_X_OFFSET
-        iz = int(zi[i]) - _HEX_Z_OFFSET
-        if 0 <= ix < _HEX_LON.shape[0] and 0 <= iz < _HEX_LON.shape[1]:
-            clo = _HEX_LON[ix, iz]
-            if not np.isnan(clo):
-                lon[i] = clo
-                lat[i] = _HEX_LAT[ix, iz]
-                continue
-        clo, cla = _affine_xyz_to_lonlat(xa[i], yi[i], zi[i])
-        lon[i] = clo
-        lat[i] = cla
-    return lon, lat
+    original_shape = xa.shape
+    xa = xa.astype(np.int64, copy=False).ravel()
+    yi = np.asarray(y).ravel()
+    zi = np.asarray(z).astype(np.int64, copy=False).ravel()
+    ix = xa - _HEX_X_OFFSET
+    iz = zi - _HEX_Z_OFFSET
+    in_bounds = (
+        (ix >= 0) & (ix < _HEX_LON.shape[0])
+        & (iz >= 0) & (iz < _HEX_LON.shape[1])
+    )
+
+    lon = np.empty(xa.size, dtype=float)
+    lat = np.empty(xa.size, dtype=float)
+    direct = np.zeros(xa.size, dtype=bool)
+    bounded_positions = np.flatnonzero(in_bounds)
+    if bounded_positions.size:
+        bounded_lon = _HEX_LON[ix[bounded_positions], iz[bounded_positions]]
+        available = ~np.isnan(bounded_lon)
+        direct_positions = bounded_positions[available]
+        direct[direct_positions] = True
+        lon[direct_positions] = bounded_lon[available]
+        lat[direct_positions] = _HEX_LAT[ix[direct_positions], iz[direct_positions]]
+
+    fallback = ~direct
+    if fallback.any():
+        fallback_lon, fallback_lat = _affine_xyz_to_lonlat(
+            xa[fallback], yi[fallback], zi[fallback],
+        )
+        lon[fallback] = fallback_lon
+        lat[fallback] = fallback_lat
+    return lon.reshape(original_shape), lat.reshape(original_shape)
 
 
 def hex_to_mercator(x, y, z):

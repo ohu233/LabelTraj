@@ -9,6 +9,7 @@ from utils.osm_pois import (
     element_lon_lat,
     iter_query_tiles,
     preferred_name,
+    _normalize_station_name,
 )
 
 
@@ -22,8 +23,13 @@ class OSMPOITest(unittest.TestCase):
             classify_tags({"railway": "station", "train": "yes", "subway": "yes"}),
             [CATEGORY_SUBWAY, CATEGORY_TRAIN],
         )
+        self.assertEqual(classify_tags({"railway": "halt"}), [])
         self.assertEqual(
-            classify_tags({"railway": "halt"}),
+            classify_tags({"railway": "halt", "train": "yes"}),
+            [CATEGORY_TRAIN],
+        )
+        self.assertEqual(
+            classify_tags({"railway": "station", "public_transport": "station"}),
             [CATEGORY_TRAIN],
         )
         self.assertEqual(classify_tags({"barrier": "toll_booth"}), [CATEGORY_TOLL])
@@ -58,6 +64,41 @@ class OSMPOITest(unittest.TestCase):
                 "name": "测试站（在建）",
             }),
             [],
+        )
+
+    def test_train_classification_requires_passenger_evidence(self):
+        self.assertEqual(classify_tags({"railway": "station"}), [])
+        self.assertEqual(
+            classify_tags({"railway": "station", "public_transport": "station", "train": "no"}),
+            [],
+        )
+        self.assertEqual(
+            classify_tags({"railway": "station", "train": "yes", "name": "丁桥油库卸油站"}),
+            [],
+        )
+        self.assertEqual(
+            classify_tags({"railway": "station", "public_transport": "station", "name": "丁集矿"}),
+            [],
+        )
+
+    def test_excludes_planned_and_inactive_names(self):
+        for name in ("百步站(待建)", "常州南站(规划中)", "景德镇东（废弃）"):
+            self.assertEqual(
+                classify_tags({
+                    "railway": "station", "public_transport": "station",
+                    "train": "yes", "name": name,
+                }),
+                [],
+            )
+
+    def test_station_suffixes_share_a_deduplication_name(self):
+        self.assertEqual(
+            _normalize_station_name("南昌南站", CATEGORY_TRAIN),
+            _normalize_station_name("南昌南", CATEGORY_TRAIN),
+        )
+        self.assertEqual(
+            _normalize_station_name("嘉善火车站", CATEGORY_TRAIN),
+            _normalize_station_name("嘉善", CATEGORY_TRAIN),
         )
 
     def test_reads_node_and_center_coordinates(self):
