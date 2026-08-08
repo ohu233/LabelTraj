@@ -13,6 +13,7 @@ import os
 import sys
 import json
 import argparse
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -348,16 +349,13 @@ class PathRenderer:
     def __init__(self, state: LabelState, raw_mapdata, road_sets=None,
                  traj_df=None, current_idx=None, output_dir=None, pois=None,
                  labeled_modes=None):
-        self.state = state
+        self.raw_mapdata = raw_mapdata
         self.road_sets = road_sets
         self.traj_df = traj_df
-        self.current_idx = current_idx
         self.output_dir = output_dir
         self.labeled_modes = labeled_modes if labeled_modes is not None else {}
         self.pois = pois or []
         self.pois_by_hex = group_pois_by_hex(self.pois)
-        self._poi_scatter_meta = []
-        self._poi_hover = None
 
         # 左右分栏：左侧地图，右侧速度分布
         self.fig = plt.figure(figsize=(16, 9))
@@ -365,8 +363,19 @@ class PathRenderer:
         self.ax = self.fig.add_subplot(gs[0])
         self.ax_hist = self.fig.add_subplot(gs[1])
         self.fig.canvas.manager.set_window_title("LabelPath — Hex Grid")
+        self.fig.canvas.mpl_connect("motion_notify_event", self._on_poi_hover)
+        self.show_segment(state, current_idx, initial=True)
 
-        self._init_hex_view(state, raw_mapdata)
+    def show_segment(self, state, current_idx, initial=False):
+        """Render another OD in the existing figure instead of reopening it."""
+        self.state = state
+        self.current_idx = current_idx
+        self._poi_scatter_meta = []
+        self._poi_hover = None
+        self.ax.clear()
+        self.ax_hist.clear()
+
+        self._init_hex_view(state, self.raw_mapdata)
 
         self.ax.set_xlabel("Web Mercator X (EPSG:3857)")
         self.ax.set_ylabel("Web Mercator Y (EPSG:3857)")
@@ -397,7 +406,13 @@ class PathRenderer:
         self._draw_legend_box()
         self._draw_segment_info()
         self._init_cell_info()
-        self.fig.tight_layout()
+        if initial:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore", message="This figure includes Axes that are not compatible",
+                )
+                self.fig.tight_layout()
+        self.fig.canvas.draw_idle()
 
     # ======================== Hex View Init ========================
 
@@ -702,7 +717,6 @@ class PathRenderer:
             bbox=dict(boxstyle="round,pad=0.12", facecolor="white", alpha=0.72,
                       edgecolor="none"),
         )
-        self.fig.canvas.mpl_connect("motion_notify_event", self._on_poi_hover)
 
     def _on_poi_hover(self, event):
         """Show category and OSM name when hovering over a POI marker."""
@@ -899,7 +913,7 @@ class LabelController:
 
     def __init__(self, state: LabelState, renderer: PathRenderer,
                  output_dir: str, batch_mode: bool, current_idx: int,
-                 start_in_label_mode: bool = False):
+                 start_in_label_mode: bool = False, navigate_callback=None):
         self.state = state
         self.renderer = renderer
         self.output_dir = output_dir
@@ -909,9 +923,23 @@ class LabelController:
         self.selecting_label = False
         self.next_requested = False
         self.go_back_requested = False
+        self.navigate_callback = navigate_callback
 
         if start_in_label_mode:
             self.selecting_label = True
+            self.renderer.show_label_prompt()
+            print(f"  Select label: " + " ".join(f"{k}={v}" for k, v in LABEL_OPTIONS.items()))
+            print(f"  (Backspace to re-edit path)")
+
+    def set_segment(self, state, current_idx, start_in_label_mode=False):
+        """Point the existing controller at a newly rendered OD."""
+        self.state = state
+        self.current_idx = current_idx
+        self.saved = False
+        self.selecting_label = bool(start_in_label_mode)
+        self.next_requested = False
+        self.go_back_requested = False
+        if self.selecting_label:
             self.renderer.show_label_prompt()
             print(f"  Select label: " + " ".join(f"{k}={v}" for k, v in LABEL_OPTIONS.items()))
             print(f"  (Backspace to re-edit path)")
@@ -933,7 +961,10 @@ class LabelController:
                 print(f"  [LABELED] #{self.current_idx} -> {label}")
                 if self.batch_mode:
                     self.next_requested = True
-                    plt.close(self.renderer.fig)
+                    if self.navigate_callback is not None:
+                        self.navigate_callback(1, False)
+                    else:
+                        plt.close(self.renderer.fig)
                 else:
                     self.renderer.ax.set_title(
                         self.renderer.ax.get_title() + f" [{label}]",
@@ -971,8 +1002,11 @@ class LabelController:
                 # No steps taken — go back to previous trajectory's label
                 if self.current_idx > 0:
                     self.go_back_requested = True
-                    plt.close(self.renderer.fig)
                     print(f"  Going back to re-label previous trajectory #{self.current_idx - 1}")
+                    if self.navigate_callback is not None:
+                        self.navigate_callback(-1, True)
+                    else:
+                        plt.close(self.renderer.fig)
                 else:
                     print(f"  Already at first trajectory, cannot go back")
             elif self.state.undo():
@@ -1102,6 +1136,64 @@ def run_single(state, raw_mapdata, output_dir, batch_mode, idx,
         return idx, False
 
 
+def _print_segment_status(idx, state, relabel=False):
+    if relabel:
+        print(f"\n#{idx}  order={state.order}  mode={state.mode}  [RE-LABEL]")
+        return
+    print(f"\n{'='*60}")
+    print(f"#{idx}  order={state.order}  mode={state.mode}")
+    print(f"Start: {state.start}  ->  End: {state.end}")
+    print("Keys: W/A/S/D/Q/E=move  Backspace=undo  R=reset  "
+          "Enter=save & label  N=no-traj")
+    print(f"{'='*60}")
+
+
+def run_continuous(start_idx, make_state, raw_mapdata, output_dir,
+                   road_sets, traj_df, pois, labeled_modes):
+    """Run a batch in one persistent Matplotlib window.
+
+    Static data and offline map tiles stay cached in the same process. Moving
+    between ODs clears and redraws the two axes without destroying the GUI
+    window or reconnecting keyboard/mouse handlers.
+    """
+    state = make_state(traj_df.iloc[start_idx])
+    renderer = PathRenderer(
+        state, raw_mapdata, road_sets=road_sets, traj_df=traj_df,
+        current_idx=start_idx, output_dir=output_dir, pois=pois,
+        labeled_modes=labeled_modes,
+    )
+    controller = LabelController(
+        state, renderer, output_dir, batch_mode=True, current_idx=start_idx,
+    )
+
+    def navigate(delta, start_in_label_mode=False):
+        target = controller.current_idx + int(delta)
+        if target >= len(traj_df):
+            controller.saved = True
+            print(f"\nAll {len(traj_df)} trajectories labeled!")
+            plt.close(renderer.fig)
+            return
+        if target < 0:
+            print("  Already at first trajectory, cannot go back")
+            return
+
+        next_state = make_state(traj_df.iloc[target])
+        renderer.show_segment(next_state, target)
+        controller.set_segment(next_state, target, start_in_label_mode)
+        _print_segment_status(target, next_state, relabel=start_in_label_mode)
+
+    controller.navigate_callback = navigate
+    renderer.fig.canvas.mpl_connect("key_press_event", controller.on_key)
+
+    def on_close(event):
+        if not controller.saved:
+            print(f"  [WARN] window closed, #{controller.current_idx} not saved")
+
+    renderer.fig.canvas.mpl_connect("close_event", on_close)
+    _print_segment_status(start_idx, state)
+    plt.show(block=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Interactive path labeling tool")
     parser.add_argument("--index", type=int, default=None,
@@ -1166,94 +1258,46 @@ def main():
                    idx=args.index, road_sets=road_sets, traj_df=traj_df, pois=pois,
                    labeled_modes=labeled_modes)
 
-    elif args.batch:
-        idx = 0
-        while idx < len(traj_df):
-            state = make_state(traj_df.iloc[idx])
-            next_idx, keep_going = run_single(
-                state, raw_mapdata, output_dir, batch_mode=True,
-                idx=idx, road_sets=road_sets, traj_df=traj_df,
-                pois=pois, labeled_modes=labeled_modes,
-            )
-            if not keep_going:
-                print(f"Labeling stopped, completed up to #{idx}")
-                break
-            start_label = (next_idx < idx)
-            idx = next_idx
-            if start_label:
-                state = make_state(traj_df.iloc[idx])
-                next_idx, keep_going = run_single(
-                    state, raw_mapdata, output_dir, batch_mode=True,
-                    idx=idx, road_sets=road_sets, traj_df=traj_df,
-                    start_in_label_mode=True, pois=pois,
-                    labeled_modes=labeled_modes,
-                )
-                if not keep_going:
-                    break
-                idx = next_idx
-        if idx >= len(traj_df):
-            print(f"\nAll {len(traj_df)} trajectories labeled!")
-
     else:
-        # Prompt user for starting index or uid
-        while True:
-            try:
-                user_input = input(
-                    f"Enter starting index [0-{len(traj_df)-1}], "
-                    f"or uid (e.g. u123), or press Enter for 0: "
-                ).strip()
-                if user_input == "":
-                    start_idx = 0
-                    break
-                if user_input.lower().startswith("u"):
-                    # 按数据(uid)定位：跳到该 uid 的第一条记录
-                    uid_val = int(user_input[1:])
-                    if "uid" not in traj_df.columns:
-                        print(f"  Error: CSV has no uid column")
-                        continue
-                    matches = traj_df.index[traj_df["uid"] == uid_val].tolist()
-                    if not matches:
-                        print(f"  Error: uid {uid_val} not found")
-                        continue
-                    start_idx = int(matches[0])
-                    print(f"  uid {uid_val} -> index {start_idx}")
-                    break
-                start_idx = int(user_input)
-                if 0 <= start_idx < len(traj_df):
-                    break
-                print(f"  Error: index out of range [0, {len(traj_df)-1}]")
-            except ValueError:
-                print(f"  Error: please enter a valid integer (index or u<uid>)")
-            except (EOFError, KeyboardInterrupt):
-                print("\nExiting.")
-                sys.exit(0)
+        if args.batch:
+            start_idx = 0
+        else:
+            # Prompt user for starting index or uid.
+            while True:
+                try:
+                    user_input = input(
+                        f"Enter starting index [0-{len(traj_df)-1}], "
+                        f"or uid (e.g. u123), or press Enter for 0: "
+                    ).strip()
+                    if user_input == "":
+                        start_idx = 0
+                        break
+                    if user_input.lower().startswith("u"):
+                        uid_val = int(user_input[1:])
+                        if "uid" not in traj_df.columns:
+                            print("  Error: CSV has no uid column")
+                            continue
+                        matches = traj_df.index[traj_df["uid"] == uid_val].tolist()
+                        if not matches:
+                            print(f"  Error: uid {uid_val} not found")
+                            continue
+                        start_idx = int(matches[0])
+                        print(f"  uid {uid_val} -> index {start_idx}")
+                        break
+                    start_idx = int(user_input)
+                    if 0 <= start_idx < len(traj_df):
+                        break
+                    print(f"  Error: index out of range [0, {len(traj_df)-1}]")
+                except ValueError:
+                    print("  Error: please enter a valid integer (index or u<uid>)")
+                except (EOFError, KeyboardInterrupt):
+                    print("\nExiting.")
+                    sys.exit(0)
 
-        idx = start_idx
-        while idx < len(traj_df):
-            state = make_state(traj_df.iloc[idx])
-            next_idx, keep_going = run_single(
-                state, raw_mapdata, output_dir, batch_mode=True,
-                idx=idx, road_sets=road_sets, traj_df=traj_df,
-                pois=pois, labeled_modes=labeled_modes,
-            )
-            if not keep_going:
-                print(f"Labeling stopped, completed up to #{idx}")
-                break
-            start_label = (next_idx < idx)
-            idx = next_idx
-            if start_label:
-                state = make_state(traj_df.iloc[idx])
-                next_idx, keep_going = run_single(
-                    state, raw_mapdata, output_dir, batch_mode=True,
-                    idx=idx, road_sets=road_sets, traj_df=traj_df,
-                    start_in_label_mode=True, pois=pois,
-                    labeled_modes=labeled_modes,
-                )
-                if not keep_going:
-                    break
-                idx = next_idx
-        if idx >= len(traj_df):
-            print(f"\nAll {len(traj_df)} trajectories labeled!")
+        run_continuous(
+            start_idx, make_state, raw_mapdata, output_dir,
+            road_sets, traj_df, pois, labeled_modes,
+        )
 
 
 if __name__ == "__main__":

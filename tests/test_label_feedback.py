@@ -75,6 +75,38 @@ class LabelFeedbackTest(unittest.TestCase):
         self.assertIn("UID OD:   2 / 3", renderer.ax.texts[-1].get_text())
         plt.close(renderer.fig)
 
+    def test_batch_controller_navigates_without_closing_window(self):
+        state = mock.Mock(path_history=[(0, 0, 0)])
+        renderer = mock.Mock()
+        navigate = mock.Mock()
+        controller = LabelPath.LabelController(
+            state, renderer, "unused", batch_mode=True, current_idx=4,
+            navigate_callback=navigate,
+        )
+        controller.selecting_label = True
+
+        with mock.patch.object(controller, "_finalize"), \
+             mock.patch.object(LabelPath.plt, "close") as close:
+            controller.on_key(mock.Mock(key="1"))
+
+        navigate.assert_called_once_with(1, False)
+        close.assert_not_called()
+
+    def test_batch_controller_goes_back_in_same_window(self):
+        state = mock.Mock(path_history=[(0, 0, 0)])
+        renderer = mock.Mock()
+        navigate = mock.Mock()
+        controller = LabelPath.LabelController(
+            state, renderer, "unused", batch_mode=True, current_idx=4,
+            navigate_callback=navigate,
+        )
+
+        with mock.patch.object(LabelPath.plt, "close") as close:
+            controller.on_key(mock.Mock(key="backspace"))
+
+        navigate.assert_called_once_with(-1, True)
+        close.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
