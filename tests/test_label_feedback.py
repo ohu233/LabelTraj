@@ -26,6 +26,22 @@ class LabelFeedbackTest(unittest.TestCase):
         with mock.patch.object(LabelPath.os.path, "exists", return_value=False):
             self.assertEqual(LabelPath.load_labeled_modes("unused"), {})
 
+    def test_startup_opens_first_unlabeled_od_without_prompt(self):
+        traj_df = pd.DataFrame([
+            {"uid": 10, "idx_o": 0},
+            {"uid": 10, "idx_o": 1},
+            {"uid": 20, "idx_o": 0},
+        ])
+        labeled_modes = {(10, 0): "TG", (10, 1): "TS"}
+
+        self.assertEqual(LabelPath.first_unlabeled_index(traj_df, labeled_modes), 2)
+        self.assertEqual(
+            LabelPath.first_unlabeled_index(
+                traj_df, {**labeled_modes, (20, 0): "GG"},
+            ),
+            0,
+        )
+
     def test_saved_point_colors_match_road_overlay_colors(self):
         for mode, color in LabelPath.MODE_COLORS.items():
             self.assertEqual(LabelPath.LABELED_POINT_COLORS[mode], color)
@@ -129,10 +145,17 @@ class LabelFeedbackTest(unittest.TestCase):
     def test_road_buttons_toggle_layer_without_rescaling_and_persist_on_redraw(self):
         renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
         renderer.fig, renderer.ax = plt.subplots()
+        renderer.ax_info = renderer.ax
         renderer.road_visibility = {mode: True for mode in LabelPath.MODE_LIST}
         renderer._road_artists = {}
         renderer._road_buttons = {}
         renderer._init_road_toggle_buttons()
+
+        button_positions = [
+            renderer._road_buttons[mode].ax.get_position() for mode in LabelPath.MODE_LIST
+        ]
+        self.assertEqual(len({round(position.x0, 6) for position in button_positions}), 1)
+        self.assertEqual(len({round(position.y0, 6) for position in button_positions}), 5)
 
         renderer.ax.set_xlim(10, 20)
         renderer.ax.set_ylim(30, 40)
@@ -160,6 +183,21 @@ class LabelFeedbackTest(unittest.TestCase):
 
         self.assertFalse(renderer._road_artists["TG"].get_visible())
         self.assertEqual((renderer.ax.get_xlim(), renderer.ax.get_ylim()), before)
+        plt.close(renderer.fig)
+
+    def test_clickable_label_buttons_show_1_to_6_mapping_and_share_callback(self):
+        renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+        renderer.fig = plt.figure()
+        renderer._label_buttons = {}
+        renderer.label_select_callback = mock.Mock()
+
+        renderer._init_label_buttons()
+
+        self.assertEqual(set(renderer._label_buttons), set(LabelPath.LABEL_OPTIONS.values()))
+        for key, mode in LabelPath.LABEL_OPTIONS.items():
+            self.assertTrue(renderer._label_buttons[mode].label.get_text().startswith(f"{key}  {mode}"))
+        renderer._request_label_mode("GSD")
+        renderer.label_select_callback.assert_called_once_with("GSD")
         plt.close(renderer.fig)
 
     def test_uid_od_list_uses_saved_mode_colors_and_highlights_current_row(self):
@@ -294,7 +332,7 @@ class LabelFeedbackTest(unittest.TestCase):
         self.assertEqual(uid, LabelPath.UID_NAV_SCROLL_STEP)
         plt.close(renderer.fig)
 
-    def test_batch_controller_navigates_without_closing_window(self):
+    def test_number_key_saves_mode_directly_and_navigates(self):
         state = mock.Mock(path_history=[(0, 0, 0)])
         renderer = mock.Mock()
         navigate = mock.Mock()
@@ -302,14 +340,28 @@ class LabelFeedbackTest(unittest.TestCase):
             state, renderer, "unused", batch_mode=True, current_idx=4,
             navigate_callback=navigate,
         )
-        controller.selecting_label = True
 
-        with mock.patch.object(controller, "_finalize"), \
+        with mock.patch.object(controller, "_finalize") as finalize, \
              mock.patch.object(LabelPath.plt, "close") as close:
             controller.on_key(mock.Mock(key="1"))
 
-        navigate.assert_called_once_with(1, False)
+        finalize.assert_called_once_with("TG")
+        navigate.assert_called_once_with(1)
         close.assert_not_called()
+
+    def test_enter_no_longer_starts_or_saves_a_label(self):
+        state = mock.Mock(path_history=[(0, 0, 0)])
+        renderer = mock.Mock()
+        controller = LabelPath.LabelController(
+            state, renderer, "unused", batch_mode=True, current_idx=4,
+            navigate_callback=mock.Mock(),
+        )
+
+        with mock.patch.object(controller, "_finalize") as finalize:
+            controller.on_key(mock.Mock(key="enter"))
+
+        finalize.assert_not_called()
+        controller.navigate_callback.assert_not_called()
 
     def test_batch_controller_goes_back_in_same_window(self):
         state = mock.Mock(path_history=[(0, 0, 0)])
@@ -323,7 +375,7 @@ class LabelFeedbackTest(unittest.TestCase):
         with mock.patch.object(LabelPath.plt, "close") as close:
             controller.on_key(mock.Mock(key="backspace"))
 
-        navigate.assert_called_once_with(-1, True)
+        navigate.assert_called_once_with(-1)
         close.assert_not_called()
 
 

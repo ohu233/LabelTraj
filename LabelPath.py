@@ -147,11 +147,6 @@ POI_STYLES = {
 POI_LABEL_LIMIT = 45
 
 
-def _label_prompt_str():
-    """由 LABEL_OPTIONS 生成标签选择提示文本，避免硬编码漂移。"""
-    return "  ".join(f"[{k}] {v}" for k, v in LABEL_OPTIONS.items())
-
-
 def _annotation_key(row):
     """Return the stable (uid, idx_o) key shared by source and label CSVs."""
     try:
@@ -192,6 +187,20 @@ def load_labeled_modes(output_dir):
             result[key] = mode
     return result
 
+
+def first_unlabeled_index(traj_df, labeled_modes):
+    """Return the first unfinished OD, falling back to index 0."""
+    if traj_df is None or traj_df.empty:
+        return 0
+    if not {"uid", "idx_o"}.issubset(traj_df.columns):
+        return 0
+    uid_values = pd.to_numeric(traj_df["uid"], errors="coerce").to_numpy()
+    idx_o_values = pd.to_numeric(traj_df["idx_o"], errors="coerce").to_numpy()
+    for position, (uid, idx_o) in enumerate(zip(uid_values, idx_o_values)):
+        if pd.isna(uid) or pd.isna(idx_o) or (int(uid), int(idx_o)) not in labeled_modes:
+            return position
+    return 0
+
 # ========================== Hex Key Bindings ==========================
 HEX_KEY_MAP = {
     "d": ("move", 1),  "right": ("move", 1),      # 右上
@@ -203,7 +212,6 @@ HEX_KEY_MAP = {
     "backspace": ("undo", None),
     "ctrl+z":    ("undo", None),
     "r":         ("reset", None),
-    "enter":     ("save", None),
 }
 
 # ========================== Data Loading ==========================
@@ -438,7 +446,9 @@ class PathRenderer:
         self.road_visibility = {mode: True for mode in MODE_LIST}
         self._road_artists = {}
         self._road_buttons = {}
+        self._label_buttons = {}
         self.segment_select_callback = None
+        self.label_select_callback = None
         self._uid_list_uid = None
         self._uid_list_offset = 0
         self._uid_list_hit_rows = []
@@ -463,9 +473,11 @@ class PathRenderer:
         self.fig.canvas.mpl_connect("button_press_event", self._on_uid_list_click)
         self.fig.canvas.mpl_connect("button_press_event", self._on_uid_nav_click)
         self.show_segment(state, current_idx, initial=True)
+        # Bottom is reserved only for direct mode labels; road switches live in
+        # the right-side legend card so the two actions cannot be confused.
+        self.fig.subplots_adjust(bottom=0.115)
         self._init_road_toggle_buttons()
-        # Reserve a clear band between the x-axis labels and the bottom controls.
-        self.fig.subplots_adjust(bottom=0.145)
+        self._init_label_buttons()
         self.fig.canvas.draw_idle()
 
     def _prepare_static_indexes(self):
@@ -559,12 +571,8 @@ class PathRenderer:
         self.ax.yaxis.offsetText.set_visible(False)
         self.ax.grid(False)
 
-        # ---- 出行模式颜色图例（路网渲染分组）----
-        mode_handles = [
-            Line2D([0], [0], color=MODE_COLORS[m], lw=3,
-                   label=f"{m} {MODE_LABELS.get(m, '')}")
-            for m in MODE_LIST
-        ]
+        # Road colors are shown by the vertical toggle buttons in the legend
+        # card. The conventional legend only needs the cached OSM POIs.
         poi_handles = [
             Line2D(
                 [0], [0], linestyle="None", marker=style["marker"],
@@ -578,12 +586,13 @@ class PathRenderer:
         self.ax_info.clear()
         self.ax_info.axis("off")
         self._init_info_panel()
-        self.ax_info.legend(
-            handles=mode_handles + poi_handles, loc="upper left",
-            bbox_to_anchor=(0.055, 0.272), borderaxespad=0.0,
-            fontsize=7.2, handlelength=1.5, borderpad=0.0,
-            labelspacing=0.35, frameon=False,
-        )
+        if poi_handles:
+            self.ax_info.legend(
+                handles=poi_handles, loc="upper left",
+                bbox_to_anchor=(0.055, 0.092), borderaxespad=0.0,
+                fontsize=7.0, handlelength=1.5, borderpad=0.0,
+                labelspacing=0.28, frameon=False,
+            )
 
         self._update_title()
         self._draw_legend_box()
@@ -600,6 +609,10 @@ class PathRenderer:
     def set_segment_select_callback(self, callback):
         """Set the absolute-row navigation callback used by the UID list."""
         self.segment_select_callback = callback
+
+    def set_label_select_callback(self, callback):
+        """Set the callback shared by the clickable mode-label buttons."""
+        self.label_select_callback = callback
 
     def set_labeled_mode(self, key, mode):
         """Update one saved label and the UID completion counter."""
@@ -875,28 +888,69 @@ class PathRenderer:
                 return
 
     def _init_road_toggle_buttons(self):
-        """Create persistent bottom buttons for the five road-network layers."""
-        button_width = 0.135
-        button_gap = 0.012
-        button_height = 0.042
-        total_width = len(MODE_LIST) * button_width + (len(MODE_LIST) - 1) * button_gap
-        left = (1.0 - total_width) / 2.0
+        """Create vertical road switches inside the right-side legend card."""
+        info_bbox = self.ax_info.get_position()
+        button_left = info_bbox.x0 + info_bbox.width * 0.055
+        button_width = info_bbox.width * 0.89
+        button_height = info_bbox.height * 0.025
+        first_y = 0.242
+        row_step = 0.034
 
         for index, mode_name in enumerate(MODE_LIST):
+            button_y = info_bbox.y0 + info_bbox.height * (first_y - index * row_step)
             button_ax = self.fig.add_axes([
-                left + index * (button_width + button_gap),
-                0.018,
+                button_left,
+                button_y,
                 button_width,
                 button_height,
             ])
             button = Button(button_ax, "")
-            button.label.set_fontsize(8)
+            button.label.set_fontsize(7.2)
             button.label.set_fontweight("bold")
             button.on_clicked(
                 lambda _event, selected_mode=mode_name: self._toggle_road_layer(selected_mode)
             )
             self._road_buttons[mode_name] = button
             self._update_road_button_style(mode_name)
+
+    def _init_label_buttons(self):
+        """Create direct-save mode buttons matching keyboard keys 1 through 6."""
+        button_width = 0.106
+        button_gap = 0.010
+        button_height = 0.036
+        left = 0.19
+        self.fig.text(
+            left - 0.015, 0.043, "标注", ha="right", va="center",
+            fontsize=8, fontweight="bold", color="#444444",
+        )
+
+        for index, (key, mode_name) in enumerate(LABEL_OPTIONS.items()):
+            button_ax = self.fig.add_axes([
+                left + index * (button_width + button_gap),
+                0.025,
+                button_width,
+                button_height,
+            ])
+            color = LABELED_POINT_COLORS.get(mode_name, (0.38, 0.38, 0.38))
+            hover_color = tuple(min(channel + 0.16, 1.0) for channel in color)
+            mode_label = MODE_LABELS.get(mode_name, "其他" if mode_name == "Other" else mode_name)
+            button = Button(
+                button_ax, f"{key}  {mode_name} {mode_label}",
+                color=color, hovercolor=hover_color,
+            )
+            button.label.set_color("white")
+            button.label.set_fontsize(8)
+            button.label.set_fontweight("bold")
+            button.ax.patch.set_edgecolor("#303030")
+            button.ax.patch.set_linewidth(1.2)
+            button.on_clicked(
+                lambda _event, selected_mode=mode_name: self._request_label_mode(selected_mode)
+            )
+            self._label_buttons[mode_name] = button
+
+    def _request_label_mode(self, mode_name):
+        if self.label_select_callback is not None:
+            self.label_select_callback(mode_name)
 
     def _toggle_road_layer(self, mode_name):
         """Toggle one road layer without redrawing or changing the viewport."""
@@ -1333,7 +1387,7 @@ class PathRenderer:
             ("keys", 0.76, 0.22, "Keys"),
             ("segment", 0.55, 0.19, "Segment Info"),
             ("cell", 0.34, 0.19, "当前栅格"),
-            ("legend", 0.02, 0.30, "地图图例"),
+            ("legend", 0.02, 0.30, "路网开关 / 地点图例"),
         )
         self._info_cards = {}
         self._info_titles = {}
@@ -1359,8 +1413,9 @@ class PathRenderer:
             "Arrow/QWEASD  move\n"
             "Backspace     undo\n"
             "R             reset\n"
-            "Enter         save + label\n"
-            "N             no-traj"
+            "N             no-traj\n"
+            "1 TG  2 TS  3 DT\n"
+            "4 GG  5 GSD 6 Other"
         )
         self.ax_info.text(
             0.055, 0.928, text,
@@ -1488,14 +1543,6 @@ class PathRenderer:
         self._info_titles["cell"].set_text(f"当前栅格 {cur}")
         self.cell_info_text.set_text(body)
 
-    def show_label_prompt(self):
-        """Show the label selection prompt after Enter is pressed."""
-        self.ax.set_title(
-            "SELECT LABEL:  " + _label_prompt_str(),
-            fontsize=12, fontfamily="monospace", color="darkblue",
-        )
-        self.fig.canvas.draw_idle()
-
     def refresh(self):
         """Incremental update: path line + cursor position."""
         state = self.state
@@ -1521,36 +1568,45 @@ class LabelController:
 
     def __init__(self, state: LabelState, renderer: PathRenderer,
                  output_dir: str, batch_mode: bool, current_idx: int,
-                 start_in_label_mode: bool = False, navigate_callback=None):
+                 navigate_callback=None):
         self.state = state
         self.renderer = renderer
         self.output_dir = output_dir
         self.batch_mode = batch_mode
         self.current_idx = current_idx
         self.saved = False
-        self.selecting_label = False
         self.next_requested = False
         self.go_back_requested = False
         self.navigate_callback = navigate_callback
 
-        if start_in_label_mode:
-            self.selecting_label = True
-            self.renderer.show_label_prompt()
-            print(f"  Select label: " + " ".join(f"{k}={v}" for k, v in LABEL_OPTIONS.items()))
-            print(f"  (Backspace to re-edit path)")
-
-    def set_segment(self, state, current_idx, start_in_label_mode=False):
+    def set_segment(self, state, current_idx):
         """Point the existing controller at a newly rendered OD."""
         self.state = state
         self.current_idx = current_idx
         self.saved = False
-        self.selecting_label = bool(start_in_label_mode)
         self.next_requested = False
         self.go_back_requested = False
-        if self.selecting_label:
-            self.renderer.show_label_prompt()
-            print(f"  Select label: " + " ".join(f"{k}={v}" for k, v in LABEL_OPTIONS.items()))
-            print(f"  (Backspace to re-edit path)")
+
+    def save_mode(self, label):
+        """Save one mode from either a number key or a clickable button."""
+        canonical_mode = _canonical_label_mode(label)
+        if canonical_mode is None:
+            return
+        self._finalize(canonical_mode)
+        self.saved = True
+        print(f"  [LABELED] #{self.current_idx} -> {canonical_mode}")
+        if self.batch_mode:
+            self.next_requested = True
+            if self.navigate_callback is not None:
+                self.navigate_callback(1)
+            else:
+                plt.close(self.renderer.fig)
+        else:
+            self.renderer.ax.set_title(
+                self.renderer.ax.get_title() + f" [{canonical_mode}]",
+                fontsize=11, fontfamily="monospace",
+            )
+            self.renderer.fig.canvas.draw_idle()
 
     def on_key(self, event):
         global _NO_TRAJ_MODE
@@ -1559,32 +1615,9 @@ class LabelController:
 
         key = event.key.lower()
 
-        # --- label selection mode: 1-5 to pick, backspace to cancel ---
-        if self.selecting_label:
-            if key in LABEL_OPTIONS:
-                label = LABEL_OPTIONS[key]
-                self._finalize(label)
-                self.selecting_label = False
-                self.saved = True
-                print(f"  [LABELED] #{self.current_idx} -> {label}")
-                if self.batch_mode:
-                    self.next_requested = True
-                    if self.navigate_callback is not None:
-                        self.navigate_callback(1, False)
-                    else:
-                        plt.close(self.renderer.fig)
-                else:
-                    self.renderer.ax.set_title(
-                        self.renderer.ax.get_title() + f" [{label}]",
-                        fontsize=11, fontfamily="monospace",
-                    )
-                    self.renderer.fig.canvas.draw_idle()
-            elif key == "backspace":
-                # Cancel label selection, return to path editing
-                self.selecting_label = False
-                self.renderer._update_title()
-                self.renderer.fig.canvas.draw_idle()
-                print(f"  Label selection cancelled, back to path editing")
+        # Number keys save the mode immediately; Enter is no longer required.
+        if key in LABEL_OPTIONS:
+            self.save_mode(LABEL_OPTIONS[key])
             return
 
         # N：切换"不保存轨迹"模式——开启后保存时 traj(路径)留空，其余字段照常
@@ -1612,7 +1645,7 @@ class LabelController:
                     self.go_back_requested = True
                     print(f"  Going back to re-label previous trajectory #{self.current_idx - 1}")
                     if self.navigate_callback is not None:
-                        self.navigate_callback(-1, True)
+                        self.navigate_callback(-1)
                     else:
                         plt.close(self.renderer.fig)
                 else:
@@ -1623,12 +1656,6 @@ class LabelController:
         elif action == "reset":
             self.state.reset()
             self.renderer.refresh()
-
-        elif action == "save":
-            self.selecting_label = True
-            self.renderer.show_label_prompt()
-            print(f"  Select label: " + " ".join(f"{k}={v}" for k, v in LABEL_OPTIONS.items()))
-            print(f"  (Backspace to cancel)")
 
     def _finalize(self, label):
         """Write the complete record (path + label) to CSV and PNG.
@@ -1706,7 +1733,7 @@ class LabelController:
 # ========================== Main Loop ==========================
 
 def run_single(state, raw_mapdata, output_dir, batch_mode, idx,
-               start_in_label_mode=False, road_sets=None, traj_df=None, pois=None,
+               road_sets=None, traj_df=None, pois=None,
                labeled_modes=None):
     """Run labeling for one trajectory. Returns (next_idx, keep_going)."""
     renderer = PathRenderer(state, raw_mapdata, road_sets=road_sets,
@@ -1715,7 +1742,6 @@ def run_single(state, raw_mapdata, output_dir, batch_mode, idx,
                             labeled_modes=labeled_modes)
     controller = LabelController(
         state, renderer, output_dir, batch_mode, idx,
-        start_in_label_mode=start_in_label_mode,
     )
 
     def select_segment(target):
@@ -1729,6 +1755,7 @@ def run_single(state, raw_mapdata, output_dir, batch_mode, idx,
         _print_segment_status(int(target), next_state)
 
     renderer.set_segment_select_callback(select_segment)
+    renderer.set_label_select_callback(controller.save_mode)
 
     renderer.fig.canvas.mpl_connect("key_press_event", controller.on_key)
 
@@ -1738,14 +1765,12 @@ def run_single(state, raw_mapdata, output_dir, batch_mode, idx,
 
     renderer.fig.canvas.mpl_connect("close_event", on_close)
 
-    if not start_in_label_mode:
-        print(f"\n{'='*60}")
-        print(f"#{idx}  order={state.order}  mode={state.mode}")
-        print(f"Start: {state.start}  ->  End: {state.end}")
-        print(f"Keys: W/A/S/D/Q/E=move  Backspace=undo  R=reset  Enter=save & label  N=no-traj")
-        print(f"{'='*60}")
-    else:
-        print(f"\n#{idx}  order={state.order}  mode={state.mode}  [RE-LABEL]")
+    print(f"\n{'='*60}")
+    print(f"#{idx}  order={state.order}  mode={state.mode}")
+    print(f"Start: {state.start}  ->  End: {state.end}")
+    print("Keys: W/A/S/D/Q/E=move  Backspace=undo  R=reset  "
+          "1-6=save mode  N=no-traj")
+    print(f"{'='*60}")
 
     plt.show(block=True)
 
@@ -1757,15 +1782,12 @@ def run_single(state, raw_mapdata, output_dir, batch_mode, idx,
         return idx, False
 
 
-def _print_segment_status(idx, state, relabel=False):
-    if relabel:
-        print(f"\n#{idx}  order={state.order}  mode={state.mode}  [RE-LABEL]")
-        return
+def _print_segment_status(idx, state):
     print(f"\n{'='*60}")
     print(f"#{idx}  order={state.order}  mode={state.mode}")
     print(f"Start: {state.start}  ->  End: {state.end}")
     print("Keys: W/A/S/D/Q/E=move  Backspace=undo  R=reset  "
-          "Enter=save & label  N=no-traj")
+          "1-6=save mode  N=no-traj")
     print(f"{'='*60}")
 
 
@@ -1787,7 +1809,7 @@ def run_continuous(start_idx, make_state, raw_mapdata, output_dir,
         state, renderer, output_dir, batch_mode=True, current_idx=start_idx,
     )
 
-    def show_target(target, start_in_label_mode=False):
+    def show_target(target):
         target = int(target)
         if target >= len(traj_df):
             controller.saved = True
@@ -1800,14 +1822,15 @@ def run_continuous(start_idx, make_state, raw_mapdata, output_dir,
 
         next_state = make_state(traj_df.iloc[target])
         renderer.show_segment(next_state, target)
-        controller.set_segment(next_state, target, start_in_label_mode)
-        _print_segment_status(target, next_state, relabel=start_in_label_mode)
+        controller.set_segment(next_state, target)
+        _print_segment_status(target, next_state)
 
-    def navigate(delta, start_in_label_mode=False):
-        show_target(controller.current_idx + int(delta), start_in_label_mode)
+    def navigate(delta):
+        show_target(controller.current_idx + int(delta))
 
     controller.navigate_callback = navigate
     renderer.set_segment_select_callback(show_target)
+    renderer.set_label_select_callback(controller.save_mode)
     renderer.fig.canvas.mpl_connect("key_press_event", controller.on_key)
 
     def on_close(event):
@@ -1886,40 +1909,8 @@ def main():
                    labeled_modes=labeled_modes)
 
     else:
-        if args.batch:
-            start_idx = 0
-        else:
-            # Prompt user for starting index or uid.
-            while True:
-                try:
-                    user_input = input(
-                        f"Enter starting index [0-{len(traj_df)-1}], "
-                        f"or uid (e.g. u123), or press Enter for 0: "
-                    ).strip()
-                    if user_input == "":
-                        start_idx = 0
-                        break
-                    if user_input.lower().startswith("u"):
-                        uid_val = int(user_input[1:])
-                        if "uid" not in traj_df.columns:
-                            print("  Error: CSV has no uid column")
-                            continue
-                        matches = traj_df.index[traj_df["uid"] == uid_val].tolist()
-                        if not matches:
-                            print(f"  Error: uid {uid_val} not found")
-                            continue
-                        start_idx = int(matches[0])
-                        print(f"  uid {uid_val} -> index {start_idx}")
-                        break
-                    start_idx = int(user_input)
-                    if 0 <= start_idx < len(traj_df):
-                        break
-                    print(f"  Error: index out of range [0, {len(traj_df)-1}]")
-                except ValueError:
-                    print("  Error: please enter a valid integer (index or u<uid>)")
-                except (EOFError, KeyboardInterrupt):
-                    print("\nExiting.")
-                    sys.exit(0)
+        start_idx = first_unlabeled_index(traj_df, labeled_modes)
+        print(f"Opening annotation view at first unfinished OD: #{start_idx}")
 
         run_continuous(
             start_idx, make_state, raw_mapdata, output_dir,
