@@ -12,6 +12,7 @@ Usage:
 import os
 import sys
 import json
+import re
 import argparse
 import warnings
 
@@ -95,6 +96,7 @@ HEX_PKL_PATH = r"data\hex_grid_2025.pkl"
 DEFAULT_CSV_PATH = r"data\dataset_multicity_20230917_unpacked.csv"
 DEFAULT_OUTPUT_DIR = "label_output"
 IGNORED_POINT_FILENAME = "ignored_points.csv"
+EXCLUDED_UID_FILENAME = "excluded_uids.csv"
 
 DISTANCE_THRESHOLD = 1.0
 
@@ -223,6 +225,75 @@ def save_ignored_points(output_dir, ignored_points):
     os.replace(temp_path, csv_path)
 
 
+def load_excluded_uids(output_dir):
+    """Load UID trajectories omitted from the dated labeled-data copy."""
+    csv_path = os.path.join(output_dir, EXCLUDED_UID_FILENAME)
+    if not os.path.exists(csv_path):
+        return set()
+    try:
+        excluded = pd.read_csv(csv_path, encoding="utf-8")
+    except (OSError, ValueError, pd.errors.ParserError) as exc:
+        print(f"  [WARN] Failed to load excluded UIDs: {exc}")
+        return set()
+    if "uid" not in excluded.columns:
+        print("  [WARN] Excluded UID file lacks uid column")
+        return set()
+    result = set()
+    for uid in excluded["uid"]:
+        try:
+            result.add(int(uid))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return result
+
+
+def save_excluded_uids(output_dir, excluded_uids):
+    """Persist excluded UID trajectories atomically."""
+    os.makedirs(output_dir, exist_ok=True)
+    csv_path = os.path.join(output_dir, EXCLUDED_UID_FILENAME)
+    temp_path = csv_path + ".tmp"
+    pd.DataFrame(
+        sorted(int(uid) for uid in excluded_uids), columns=["uid"],
+    ).to_csv(temp_path, index=False, encoding="utf-8")
+    os.replace(temp_path, csv_path)
+
+
+def derive_labeled_data_date(csv_path, traj_df=None):
+    """Derive YYYYMMDD from the source filename, then from trajectory UIDs."""
+    for match in re.findall(r"(?<!\d)(20\d{6})(?!\d)", os.path.basename(csv_path)):
+        if not pd.isna(pd.to_datetime(match, format="%Y%m%d", errors="coerce")):
+            return match
+    if traj_df is not None and not traj_df.empty and "uid" in traj_df.columns:
+        for uid in traj_df["uid"]:
+            try:
+                candidate = str(int(uid))[:8]
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if len(candidate) == 8 and not pd.isna(pd.to_datetime(
+                    candidate, format="%Y%m%d", errors="coerce")):
+                return candidate
+    return pd.Timestamp.now().strftime("%Y%m%d")
+
+
+def write_labeled_data_copy(output_dir, data_date, excluded_uids):
+    """Write the sorted active-label copy without excluded UID trajectories."""
+    source_path = os.path.join(output_dir, "traj_labeled.csv")
+    export_path = os.path.join(output_dir, f"labeled_data_{data_date}.csv")
+    if not os.path.exists(source_path):
+        return export_path, 0
+    labeled = pd.read_csv(source_path, encoding="utf-8")
+    if excluded_uids and "uid" in labeled.columns:
+        uid_values = pd.to_numeric(labeled["uid"], errors="coerce")
+        labeled = labeled.loc[
+            ~uid_values.isin(tuple(int(uid) for uid in excluded_uids))
+        ]
+    labeled = sort_labeled_records(labeled)
+    export_temp = export_path + ".tmp"
+    labeled.to_csv(export_temp, index=False, encoding="utf-8")
+    os.replace(export_temp, export_path)
+    return export_path, len(labeled)
+
+
 def remove_labeled_keys(output_dir, keys):
     """Remove OD labels made invalid by an ignored/restored sampled point."""
     keys = {tuple(map(int, key)) for key in keys if key is not None}
@@ -291,9 +362,11 @@ def normalize_label_storage(output_dir):
     return reordered
 
 
-def first_unlabeled_index(traj_df, labeled_modes, ignored_points=None):
+def first_unlabeled_index(traj_df, labeled_modes, ignored_points=None,
+                          excluded_uids=None):
     """Return the first unfinished OD, then the first reviewable OD."""
     ignored_points = ignored_points or set()
+    excluded_uids = excluded_uids or set()
     if traj_df is None or traj_df.empty:
         return 0
     if not {"uid", "idx_o"}.issubset(traj_df.columns):
@@ -301,22 +374,30 @@ def first_unlabeled_index(traj_df, labeled_modes, ignored_points=None):
     uid_values = pd.to_numeric(traj_df["uid"], errors="coerce").to_numpy()
     idx_o_values = pd.to_numeric(traj_df["idx_o"], errors="coerce").to_numpy()
     for position, (uid, idx_o) in enumerate(zip(uid_values, idx_o_values)):
+        if not pd.isna(uid) and int(uid) in excluded_uids:
+            continue
         key = None if pd.isna(uid) or pd.isna(idx_o) else (int(uid), int(idx_o))
         if key is None or (key not in labeled_modes and key not in ignored_points):
             return position
     for position, (uid, idx_o) in enumerate(zip(uid_values, idx_o_values)):
+        if not pd.isna(uid) and int(uid) in excluded_uids:
+            continue
         key = None if pd.isna(uid) or pd.isna(idx_o) else (int(uid), int(idx_o))
         if key not in ignored_points:
             return position
     return 0
 
 
-def next_nonignored_index(traj_df, ignored_points, current_idx, direction):
+def next_nonignored_index(traj_df, ignored_points, current_idx, direction,
+                          excluded_uids=None):
     """Return the next global row not ignored, or an out-of-range sentinel."""
+    excluded_uids = excluded_uids or set()
     step = 1 if int(direction) >= 0 else -1
     target = int(current_idx) + step
     while 0 <= target < len(traj_df):
-        if _annotation_key(traj_df.iloc[target]) not in ignored_points:
+        row = traj_df.iloc[target]
+        if int(row["uid"]) not in excluded_uids \
+                and _annotation_key(row) not in ignored_points:
             return target
         target += step
     return len(traj_df) if step > 0 else -1
@@ -589,13 +670,16 @@ class PathRenderer:
 
     def __init__(self, state: LabelState, raw_mapdata, road_sets=None,
                  traj_df=None, current_idx=None, output_dir=None, pois=None,
-                 labeled_modes=None, ignored_points=None):
+                 labeled_modes=None, ignored_points=None, excluded_uids=None,
+                 export_date=None):
         self.raw_mapdata = raw_mapdata
         self.road_sets = road_sets
         self.traj_df = traj_df
         self.output_dir = output_dir
         self.labeled_modes = labeled_modes if labeled_modes is not None else {}
         self.ignored_points = ignored_points if ignored_points is not None else set()
+        self.excluded_uids = excluded_uids if excluded_uids is not None else set()
+        self.export_date = export_date
         self.pois = pois or []
         self.pois_by_hex = group_pois_by_hex(self.pois)
         self.road_visibility = {mode: True for mode in MODE_LIST}
@@ -838,6 +922,15 @@ class PathRenderer:
         self.ignored_points.clear()
         self.ignored_points.update(updated_points)
         self._recount_uid_resolved(key[0])
+        export_date = getattr(self, "export_date", None)
+        if self.output_dir and export_date:
+            try:
+                write_labeled_data_copy(
+                    self.output_dir, export_date,
+                    getattr(self, "excluded_uids", set()),
+                )
+            except (OSError, ValueError, pd.errors.ParserError) as exc:
+                print(f"  [WARN] Failed to update labeled-data copy: {exc}")
         self.refresh_uid_segment_list()
         print(f"  [POINT {action.upper()}] uid={key[0]} idx={key[1]}")
 
@@ -846,17 +939,69 @@ class PathRenderer:
         if not was_ignored and target == self.current_idx:
             next_target = next_nonignored_index(
                 self.traj_df, self.ignored_points, target, 1,
+                getattr(self, "excluded_uids", set()),
             )
             if next_target >= len(self.traj_df):
                 next_target = next_nonignored_index(
                     self.traj_df, self.ignored_points, target, -1,
+                    getattr(self, "excluded_uids", set()),
                 )
             if 0 <= next_target < len(self.traj_df):
                 self.segment_select_callback(next_target)
         elif previous_position == self.current_idx:
             # The current OD endpoint changed because its next point was
             # ignored/restored; rebuild this view immediately.
-            self.segment_select_callback(self.current_idx)
+                self.segment_select_callback(self.current_idx)
+
+    def _toggle_excluded_uid(self, uid):
+        """Exclude/restore a complete UID trajectory from the dated copy."""
+        uid = int(uid)
+        was_excluded = uid in self.excluded_uids
+        updated_uids = set(self.excluded_uids)
+        if was_excluded:
+            updated_uids.remove(uid)
+        else:
+            updated_uids.add(uid)
+        try:
+            if self.output_dir:
+                save_excluded_uids(self.output_dir, updated_uids)
+                if self.export_date:
+                    write_labeled_data_copy(
+                        self.output_dir, self.export_date, updated_uids,
+                    )
+        except (OSError, ValueError, pd.errors.ParserError) as exc:
+            if self.output_dir:
+                try:
+                    save_excluded_uids(self.output_dir, self.excluded_uids)
+                except OSError as rollback_exc:
+                    print(f"  [WARN] Failed to roll back excluded UIDs: {rollback_exc}")
+            print(f"  [WARN] Failed to update excluded UID: {exc}")
+            return
+
+        self.excluded_uids.clear()
+        self.excluded_uids.update(updated_uids)
+        self._draw_uid_navigation_list(ensure_current=False)
+        self.fig.canvas.draw_idle()
+        action = "RESTORED" if was_excluded else "EXCLUDED"
+        print(f"  [UID {action}] uid={uid}")
+
+        if not was_excluded and uid == int(self.state.uid) \
+                and self.segment_select_callback is not None:
+            positions = self._uid_segment_positions.get(
+                uid, np.empty(0, dtype=np.int32),
+            )
+            if len(positions):
+                target = next_nonignored_index(
+                    self.traj_df, self.ignored_points, int(positions[-1]), 1,
+                    self.excluded_uids,
+                )
+                if target >= len(self.traj_df):
+                    target = next_nonignored_index(
+                        self.traj_df, self.ignored_points, int(positions[0]), -1,
+                        self.excluded_uids,
+                    )
+                if 0 <= target < len(self.traj_df):
+                    self.segment_select_callback(target)
 
     def _draw_uid_navigation_list(self, ensure_current=False):
         """Draw the scrollable all-UID navigation list at the far left."""
@@ -894,10 +1039,13 @@ class PathRenderer:
         row_height = (top - bottom) / UID_NAV_VISIBLE_ROWS
         dot_xs, dot_ys = [], []
         dot_facecolors, dot_edgecolors = [], []
+        excluded_xs, excluded_ys = [], []
+        excluded_uids = getattr(self, "excluded_uids", set())
         for visible_row, local_index in enumerate(range(self._uid_nav_offset, stop)):
             uid = int(uid_values[local_index])
             y = top - (visible_row + 0.5) * row_height
             is_current = uid == int(self.state.uid)
+            is_excluded = uid in excluded_uids
             if is_current:
                 ax.add_patch(Rectangle(
                     (0.02, y - row_height * 0.46), 0.93, row_height * 0.92,
@@ -905,27 +1053,45 @@ class PathRenderer:
                     edgecolor="#4c91d9", linewidth=1.0, zorder=0,
                 ))
 
-            total_od = len(self._uid_segment_positions.get(uid, ()))
-            is_complete = total_od > 0 and self._uid_resolved_counts.get(uid, 0) >= total_od
-            dot_xs.append(0.10)
-            dot_ys.append(y)
-            dot_facecolors.append("#2ca02c" if is_complete else (1.0, 1.0, 1.0, 0.0))
-            dot_edgecolors.append("#1e6b1e" if is_complete else "#a5a5a5")
+            if is_excluded:
+                excluded_xs.append(0.10)
+                excluded_ys.append(y)
+            else:
+                total_od = len(self._uid_segment_positions.get(uid, ()))
+                is_complete = (
+                    total_od > 0
+                    and self._uid_resolved_counts.get(uid, 0) >= total_od
+                )
+                dot_xs.append(0.10)
+                dot_ys.append(y)
+                dot_facecolors.append(
+                    "#2ca02c" if is_complete else (1.0, 1.0, 1.0, 0.0)
+                )
+                dot_edgecolors.append("#1e6b1e" if is_complete else "#a5a5a5")
             ax.text(
                 0.19, y, str(uid), ha="left", va="center", fontsize=7.1,
                 fontweight="bold" if is_current else "normal",
-                color="#005baa" if is_current else "#303030",
+                color="#8a8a8a" if is_excluded else (
+                    "#005baa" if is_current else "#303030"
+                ),
+                fontstyle="italic" if is_excluded else "normal",
                 transform=ax.transAxes,
             )
             self._uid_nav_hit_rows.append((
                 y - row_height * 0.5, y + row_height * 0.5, uid,
             ))
 
-        ax.scatter(
-            dot_xs, dot_ys, s=34, marker="o", facecolors=dot_facecolors,
-            edgecolors=dot_edgecolors, linewidths=0.8,
-            transform=ax.transAxes, zorder=2,
-        )
+        if dot_xs:
+            ax.scatter(
+                dot_xs, dot_ys, s=34, marker="o", facecolors=dot_facecolors,
+                edgecolors=dot_edgecolors, linewidths=0.8,
+                transform=ax.transAxes, zorder=2,
+            )
+        if excluded_xs:
+            ax.scatter(
+                excluded_xs, excluded_ys, s=38, marker="x", c="#777777",
+                linewidths=1.25, transform=ax.transAxes, zorder=2,
+            )
 
         if total > UID_NAV_VISIBLE_ROWS:
             track_y, track_height = bottom, top - bottom
@@ -961,6 +1127,8 @@ class PathRenderer:
         self.fig.canvas.draw_idle()
 
     def _first_unlabeled_position(self, uid):
+        if int(uid) in getattr(self, "excluded_uids", set()):
+            return None
         positions = self._uid_segment_positions.get(uid, np.empty(0, dtype=np.int32))
         ignored_points = getattr(self, "ignored_points", set())
         if not len(positions):
@@ -977,14 +1145,17 @@ class PathRenderer:
     def _on_uid_nav_click(self, event):
         if event.inaxes is not self.ax_uid_nav or event.ydata is None:
             return
-        if event.button != 1:
+        if event.button not in (1, 3):
             return
         for y_min, y_max, uid in self._uid_nav_hit_rows:
             if y_min <= event.ydata <= y_max:
-                target = self._first_unlabeled_position(uid)
-                if target is not None and target != self.current_idx \
-                        and self.segment_select_callback is not None:
-                    self.segment_select_callback(target)
+                if event.button == 3:
+                    self._toggle_excluded_uid(uid)
+                else:
+                    target = self._first_unlabeled_position(uid)
+                    if target is not None and target != self.current_idx \
+                            and self.segment_select_callback is not None:
+                        self.segment_select_callback(target)
                 return
 
     def _draw_uid_segment_list(self, ensure_current=False):
@@ -1877,6 +2048,11 @@ class LabelController:
                 and current_key in ignored_points:
             print("  [IGNORED] Restore this point before labeling its OD")
             return
+        excluded_uids = getattr(self.renderer, "excluded_uids", set())
+        if isinstance(excluded_uids, (set, frozenset)) \
+                and int(self.state.uid) in excluded_uids:
+            print("  [EXCLUDED] Restore this UID before labeling it")
+            return
         self._finalize(canonical_mode)
         self.saved = True
         print(f"  [LABELED] #{self.current_idx} -> {canonical_mode}")
@@ -2007,6 +2183,15 @@ class LabelController:
         csv_temp = csv_path + ".tmp"
         out_df.to_csv(csv_temp, index=False, encoding="utf-8")
         os.replace(csv_temp, csv_path)
+        export_date = getattr(self.renderer, "export_date", None)
+        if export_date:
+            try:
+                write_labeled_data_copy(
+                    self.output_dir, export_date,
+                    getattr(self.renderer, "excluded_uids", set()),
+                )
+            except (OSError, ValueError, pd.errors.ParserError) as exc:
+                print(f"  [WARN] Failed to update labeled-data copy: {exc}")
         self.renderer.refresh_uid_segment_list()
 
         print(f"  -> CSV: {csv_path}")
@@ -2021,13 +2206,16 @@ class LabelController:
 
 def run_single(state, raw_mapdata, output_dir, batch_mode, idx,
                road_sets=None, traj_df=None, pois=None,
-               labeled_modes=None, ignored_points=None):
+               labeled_modes=None, ignored_points=None, excluded_uids=None,
+               export_date=None):
     """Run labeling for one trajectory. Returns (next_idx, keep_going)."""
     renderer = PathRenderer(state, raw_mapdata, road_sets=road_sets,
                              traj_df=traj_df, current_idx=idx,
                              output_dir=output_dir, pois=pois,
                              labeled_modes=labeled_modes,
-                             ignored_points=ignored_points)
+                             ignored_points=ignored_points,
+                             excluded_uids=excluded_uids,
+                             export_date=export_date)
     controller = LabelController(
         state, renderer, output_dir, batch_mode, idx,
     )
@@ -2081,7 +2269,8 @@ def _print_segment_status(idx, state):
 
 
 def run_continuous(start_idx, make_state, raw_mapdata, output_dir,
-                   road_sets, traj_df, pois, labeled_modes, ignored_points):
+                   road_sets, traj_df, pois, labeled_modes, ignored_points,
+                   excluded_uids, export_date):
     """Run a batch in one persistent Matplotlib window.
 
     Static data and offline map tiles stay cached in the same process. Moving
@@ -2093,6 +2282,7 @@ def run_continuous(start_idx, make_state, raw_mapdata, output_dir,
         state, raw_mapdata, road_sets=road_sets, traj_df=traj_df,
         current_idx=start_idx, output_dir=output_dir, pois=pois,
         labeled_modes=labeled_modes, ignored_points=ignored_points,
+        excluded_uids=excluded_uids, export_date=export_date,
     )
     controller = LabelController(
         state, renderer, output_dir, batch_mode=True, current_idx=start_idx,
@@ -2117,6 +2307,7 @@ def run_continuous(start_idx, make_state, raw_mapdata, output_dir,
     def navigate(delta):
         target = next_nonignored_index(
             traj_df, renderer.ignored_points, controller.current_idx, delta,
+            renderer.excluded_uids,
         )
         show_target(target)
 
@@ -2196,6 +2387,18 @@ def main():
     ignored_points = load_ignored_points(output_dir)
     if ignored_points:
         print(f"Loaded ignored sampled points: {len(ignored_points):,}")
+    excluded_uids = load_excluded_uids(output_dir)
+    if excluded_uids:
+        print(f"Loaded excluded UID trajectories: {len(excluded_uids):,}")
+    export_date = derive_labeled_data_date(args.csv, traj_df)
+    try:
+        export_path, export_rows = write_labeled_data_copy(
+            output_dir, export_date, excluded_uids,
+        )
+        if os.path.exists(export_path):
+            print(f"Labeled-data copy: {export_path} ({export_rows:,} rows)")
+    except (OSError, ValueError, pd.errors.ParserError) as exc:
+        print(f"  [WARN] Failed to build labeled-data copy: {exc}")
 
     def make_state(row):
         position = int(traj_df.index.get_indexer([row.name])[0])
@@ -2209,15 +2412,19 @@ def main():
         state = make_state(traj_df.iloc[args.index])
         run_single(state, raw_mapdata, output_dir, batch_mode=False,
                    idx=args.index, road_sets=road_sets, traj_df=traj_df, pois=pois,
-                   labeled_modes=labeled_modes, ignored_points=ignored_points)
+                   labeled_modes=labeled_modes, ignored_points=ignored_points,
+                   excluded_uids=excluded_uids, export_date=export_date)
 
     else:
-        start_idx = first_unlabeled_index(traj_df, labeled_modes, ignored_points)
+        start_idx = first_unlabeled_index(
+            traj_df, labeled_modes, ignored_points, excluded_uids,
+        )
         print(f"Opening annotation view at first unfinished OD: #{start_idx}")
 
         run_continuous(
             start_idx, make_state, raw_mapdata, output_dir,
             road_sets, traj_df, pois, labeled_modes, ignored_points,
+            excluded_uids, export_date,
         )
 
 

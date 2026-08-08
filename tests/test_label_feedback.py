@@ -66,6 +66,84 @@ class LabelFeedbackTest(unittest.TestCase):
             1,
         )
 
+    def test_startup_and_navigation_skip_excluded_uid(self):
+        traj_df = pd.DataFrame([
+            {"uid": 10, "idx_o": 0},
+            {"uid": 10, "idx_o": 1},
+            {"uid": 20, "idx_o": 0},
+            {"uid": 20, "idx_o": 1},
+        ])
+
+        self.assertEqual(
+            LabelPath.first_unlabeled_index(traj_df, {}, set(), {10}), 2,
+        )
+        self.assertEqual(
+            LabelPath.next_nonignored_index(traj_df, set(), 0, 1, {10}), 2,
+        )
+
+    def test_dated_copy_uses_dataset_date_and_excludes_uid_without_main_mutation(self):
+        output_dir = LabelPath.os.path.join(
+            LabelPath.os.getcwd(), "tests", "_runtime_ignore_output",
+        )
+        active_path = LabelPath.os.path.join(output_dir, "traj_labeled.csv")
+        export_path = LabelPath.os.path.join(
+            output_dir, "labeled_data_20230917.csv",
+        )
+        excluded_path = LabelPath.os.path.join(
+            output_dir, LabelPath.EXCLUDED_UID_FILENAME,
+        )
+        try:
+            pd.DataFrame([
+                {"uid": 202309170001, "idx_o": 0, "idx_d": 1, "mode": "TG"},
+                {"uid": 202309170002, "idx_o": 0, "idx_d": 1, "mode": "GG"},
+            ]).to_csv(active_path, index=False)
+            self.assertEqual(
+                LabelPath.derive_labeled_data_date(
+                    r"data\dataset_multicity_20230917_unpacked.csv",
+                ),
+                "20230917",
+            )
+
+            renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+            renderer.output_dir = output_dir
+            renderer.export_date = "20230917"
+            renderer.excluded_uids = set()
+            renderer.state = mock.Mock(uid=202309170002)
+            renderer.traj_df = pd.DataFrame([
+                {"uid": 202309170001, "idx_o": 0},
+                {"uid": 202309170002, "idx_o": 0},
+            ])
+            renderer.ignored_points = set()
+            renderer._uid_segment_positions = {
+                202309170001: np.asarray([0]),
+                202309170002: np.asarray([1]),
+            }
+            renderer._draw_uid_navigation_list = mock.Mock()
+            renderer.fig = mock.Mock()
+            renderer.segment_select_callback = mock.Mock()
+
+            renderer._toggle_excluded_uid(202309170001)
+
+            self.assertEqual(
+                LabelPath.load_excluded_uids(output_dir), {202309170001},
+            )
+            self.assertEqual(pd.read_csv(active_path)["uid"].tolist(), [
+                202309170001, 202309170002,
+            ])
+            self.assertEqual(
+                pd.read_csv(export_path)["uid"].tolist(), [202309170002],
+            )
+
+            renderer._toggle_excluded_uid(202309170001)
+            self.assertEqual(LabelPath.load_excluded_uids(output_dir), set())
+            self.assertEqual(pd.read_csv(export_path)["uid"].tolist(), [
+                202309170001, 202309170002,
+            ])
+        finally:
+            for path in (active_path, export_path, excluded_path):
+                if LabelPath.os.path.exists(path):
+                    LabelPath.os.remove(path)
+
     def test_effective_segment_merges_intervals_across_ignored_point(self):
         traj_df = pd.DataFrame([
             {"uid": 7, "idx_o": 0, "idx_d": 1,
@@ -435,6 +513,7 @@ class LabelFeedbackTest(unittest.TestCase):
         renderer._uid_nav_values = np.asarray([10, 20, 30])
         renderer._uid_nav_index = {10: 0, 20: 1, 30: 2}
         renderer._uid_resolved_counts = {10: 2, 20: 1, 30: 0}
+        renderer.excluded_uids = {30}
         renderer._uid_nav_offset = 0
         renderer._uid_nav_hit_rows = []
 
@@ -443,7 +522,8 @@ class LabelFeedbackTest(unittest.TestCase):
         facecolors = renderer.ax_uid_nav.collections[0].get_facecolors()
         self.assertEqual(facecolors[0, 3], 1.0)
         self.assertEqual(facecolors[1, 3], 0.0)
-        self.assertEqual(facecolors[2, 3], 0.0)
+        self.assertEqual(len(facecolors), 2)
+        self.assertEqual(len(renderer.ax_uid_nav.collections[1].get_offsets()), 1)
         self.assertTrue(any(patch.get_edgecolor()[2] > 0.7
                             for patch in renderer.ax_uid_nav.patches))
         plt.close(renderer.fig)
@@ -480,6 +560,12 @@ class LabelFeedbackTest(unittest.TestCase):
         ))
         renderer.segment_select_callback.assert_called_once_with(uid)
         self.assertEqual(uid, LabelPath.UID_NAV_SCROLL_STEP)
+
+        renderer._toggle_excluded_uid = mock.Mock()
+        renderer._on_uid_nav_click(mock.Mock(
+            inaxes=renderer.ax_uid_nav, ydata=(y_min + y_max) / 2, button=3,
+        ))
+        renderer._toggle_excluded_uid.assert_called_once_with(uid)
         plt.close(renderer.fig)
 
     def test_number_key_saves_mode_directly_and_navigates(self):
@@ -505,6 +591,24 @@ class LabelFeedbackTest(unittest.TestCase):
             path_history=[(0, 0, 0)],
         )
         renderer = mock.Mock(ignored_points={(7, 3)})
+        controller = LabelPath.LabelController(
+            state, renderer, "unused", batch_mode=True, current_idx=4,
+            navigate_callback=mock.Mock(),
+        )
+
+        with mock.patch.object(controller, "_finalize") as finalize:
+            controller.save_mode("TG")
+
+        finalize.assert_not_called()
+        controller.navigate_callback.assert_not_called()
+
+    def test_excluded_current_uid_cannot_be_labeled(self):
+        state = mock.Mock(
+            uid=7,
+            row=pd.Series({"uid": 7, "idx_o": 3}),
+            path_history=[(0, 0, 0)],
+        )
+        renderer = mock.Mock(ignored_points=set(), excluded_uids={7})
         controller = LabelPath.LabelController(
             state, renderer, "unused", batch_mode=True, current_idx=4,
             navigate_callback=mock.Mock(),
