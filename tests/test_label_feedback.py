@@ -184,6 +184,25 @@ class LabelFeedbackTest(unittest.TestCase):
             1,
         )
 
+    def test_navigation_skips_final_od_when_terminal_point_is_ignored(self):
+        traj_df = pd.DataFrame([
+            {"uid": 10, "idx_o": 0, "idx_d": 1},
+            {"uid": 10, "idx_o": 1, "idx_d": 2},
+            {"uid": 10, "idx_o": 2, "idx_d": 3},
+        ])
+        ignored = {(10, 3)}
+
+        self.assertTrue(LabelPath.segment_is_reviewable(traj_df, 1, ignored))
+        self.assertFalse(LabelPath.segment_is_reviewable(traj_df, 2, ignored))
+        self.assertEqual(
+            LabelPath.next_nonignored_index(traj_df, ignored, 1, 1),
+            len(traj_df),
+        )
+        self.assertEqual(
+            LabelPath.next_nonignored_index(traj_df, ignored, len(traj_df), -1),
+            1,
+        )
+
     def test_startup_and_navigation_skip_excluded_uid(self):
         traj_df = pd.DataFrame([
             {"uid": 10, "idx_o": 0},
@@ -383,6 +402,67 @@ class LabelFeedbackTest(unittest.TestCase):
         finally:
             for name in artifact_names:
                 path = LabelPath.os.path.join(output_dir, name)
+                if LabelPath.os.path.exists(path):
+                    LabelPath.os.remove(path)
+
+    def test_ignore_terminal_point_removes_only_the_final_od_label(self):
+        traj_df = pd.DataFrame([
+            {"uid": 7, "idx_o": 0, "idx_d": 1},
+            {"uid": 7, "idx_o": 1, "idx_d": 2},
+            {"uid": 7, "idx_o": 2, "idx_d": 3},
+        ])
+        output_dir = LabelPath.os.path.join(
+            LabelPath.os.getcwd(), "tests", "_runtime_terminal_ignore_output",
+        )
+        active_path = LabelPath.os.path.join(output_dir, "traj_labeled.csv")
+        ignored_path = LabelPath.os.path.join(
+            output_dir, LabelPath.IGNORED_POINT_FILENAME,
+        )
+        try:
+            LabelPath.os.makedirs(output_dir, exist_ok=True)
+            pd.DataFrame([
+                {"uid": 7, "idx_o": 0, "mode": "TG"},
+                {"uid": 7, "idx_o": 1, "mode": "TS"},
+                {"uid": 7, "idx_o": 2, "mode": "GG"},
+            ]).to_csv(active_path, index=False)
+
+            renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+            renderer.traj_df = traj_df
+            renderer.output_dir = output_dir
+            renderer.ignored_points = set()
+            renderer.labeled_modes = {
+                (7, 0): "TG", (7, 1): "TS", (7, 2): "GG",
+            }
+            renderer.labeled_paths = {}
+            renderer.export_date = None
+            renderer.excluded_uids = set()
+            renderer._uid_segment_positions = {7: np.asarray([0, 1, 2])}
+            renderer._uid_resolved_counts = {7: 3}
+            renderer.current_idx = 0
+            renderer.segment_select_callback = mock.Mock()
+            renderer.refresh_uid_segment_list = mock.Mock()
+
+            renderer._toggle_ignored_point(
+                2, point_key=(7, 3), destination=True,
+            )
+
+            self.assertEqual(renderer.ignored_points, {(7, 3)})
+            self.assertEqual(
+                renderer.labeled_modes,
+                {(7, 0): "TG", (7, 1): "TS"},
+            )
+            self.assertEqual(renderer._uid_resolved_counts[7], 3)
+            self.assertEqual(pd.read_csv(active_path)["idx_o"].tolist(), [0, 1])
+            self.assertEqual(LabelPath.load_ignored_points(output_dir), {(7, 3)})
+
+            renderer._toggle_ignored_point(
+                2, point_key=(7, 3), destination=True,
+            )
+            self.assertEqual(renderer.ignored_points, set())
+            self.assertEqual(renderer._uid_resolved_counts[7], 2)
+            self.assertEqual(LabelPath.load_ignored_points(output_dir), set())
+        finally:
+            for path in (active_path, ignored_path):
                 if LabelPath.os.path.exists(path):
                     LabelPath.os.remove(path)
 
@@ -806,18 +886,57 @@ class LabelFeedbackTest(unittest.TestCase):
         ))
         self.assertEqual(renderer._uid_list_offset, LabelPath.UID_LIST_SCROLL_STEP)
 
-        y_min, y_max, target = renderer._uid_list_hit_rows[0]
+        y_min, y_max, entry = renderer._uid_list_hit_rows[0]
         renderer._on_uid_list_click(mock.Mock(
             inaxes=renderer.ax_uid_list, ydata=(y_min + y_max) / 2, button=1,
         ))
-        renderer.segment_select_callback.assert_called_once_with(target)
-        self.assertEqual(target, LabelPath.UID_LIST_SCROLL_STEP)
+        renderer.segment_select_callback.assert_called_once_with(entry["position"])
+        self.assertEqual(entry["position"], LabelPath.UID_LIST_SCROLL_STEP)
 
         renderer._toggle_ignored_point = mock.Mock()
         renderer._on_uid_list_click(mock.Mock(
             inaxes=renderer.ax_uid_list, ydata=(y_min + y_max) / 2, button=3,
         ))
-        renderer._toggle_ignored_point.assert_called_once_with(target)
+        renderer._toggle_ignored_point.assert_called_once_with(
+            entry["position"], point_key=entry["key"], destination=False,
+        )
+        plt.close(renderer.fig)
+
+    def test_uid_point_list_includes_and_right_clicks_terminal_point(self):
+        traj_df = pd.DataFrame([
+            {"uid": 9, "idx_o": i, "idx_d": i + 1,
+             "x_o": i, "y_o": 0, "z_o": -i,
+             "x_d": i + 1, "y_d": 0, "z_d": -(i + 1)}
+            for i in range(3)
+        ])
+        renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+        renderer.fig, renderer.ax_uid_list = plt.subplots()
+        renderer.traj_df = traj_df
+        renderer.state = mock.Mock(uid=9)
+        renderer.current_idx = 0
+        renderer.labeled_modes = {}
+        renderer.ignored_points = set()
+        renderer._uid_segment_positions = {9: np.arange(3, dtype=np.int32)}
+        renderer._uid_list_uid = None
+        renderer._uid_list_offset = 0
+        renderer._uid_list_hit_rows = []
+        renderer._toggle_ignored_point = mock.Mock()
+
+        renderer._draw_uid_segment_list(ensure_current=True)
+
+        self.assertEqual(len(renderer._uid_list_hit_rows), 4)
+        y_min, y_max, terminal = renderer._uid_list_hit_rows[-1]
+        self.assertEqual(terminal, {
+            "position": 2, "key": (9, 3), "destination": True,
+        })
+        renderer._on_uid_list_click(mock.Mock(
+            inaxes=renderer.ax_uid_list,
+            ydata=(y_min + y_max) / 2,
+            button=3,
+        ))
+        renderer._toggle_ignored_point.assert_called_once_with(
+            2, point_key=(9, 3), destination=True,
+        )
         plt.close(renderer.fig)
 
     def test_saved_path_list_scrolls_and_opens_recorded_window(self):

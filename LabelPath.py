@@ -181,6 +181,47 @@ def _annotation_key(row):
         return None
 
 
+def _destination_annotation_key(row):
+    """Return the stable key of an OD destination sampled point."""
+    try:
+        return int(row["uid"]), int(row["idx_d"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def segment_is_reviewable(traj_df, index, ignored_points=None):
+    """Return whether an OD still has a non-ignored origin and endpoint.
+
+    Ignored intermediate points are crossed by the existing effective-segment
+    merge. An ignored terminal point is different: there is no later sampled
+    point to merge to, so the final OD must be skipped until that point is
+    restored.
+    """
+    ignored_points = ignored_points or set()
+    if traj_df is None or not 0 <= int(index) < len(traj_df):
+        return False
+    cursor = int(index)
+    row = traj_df.iloc[cursor]
+    origin_key = _annotation_key(row)
+    if origin_key is None or origin_key in ignored_points:
+        return False
+    uid = origin_key[0]
+
+    while True:
+        destination_key = _destination_annotation_key(row)
+        if destination_key is None or destination_key not in ignored_points:
+            return True
+        next_cursor = cursor + 1
+        if next_cursor >= len(traj_df):
+            return False
+        next_row = traj_df.iloc[next_cursor]
+        if int(next_row["uid"]) != uid \
+                or _annotation_key(next_row) != destination_key:
+            return False
+        cursor = next_cursor
+        row = next_row
+
+
 def _canonical_label_mode(value):
     text = str(value).strip()
     for mode in LABELED_POINT_COLORS:
@@ -667,13 +708,15 @@ def first_unlabeled_index(traj_df, labeled_modes, ignored_points=None,
         if not pd.isna(uid) and int(uid) in excluded_uids:
             continue
         key = None if pd.isna(uid) or pd.isna(idx_o) else (int(uid), int(idx_o))
-        if key is None or (key not in labeled_modes and key not in ignored_points):
+        if not segment_is_reviewable(traj_df, position, ignored_points):
+            continue
+        if key is None or key not in labeled_modes:
             return position
     for position, (uid, idx_o) in enumerate(zip(uid_values, idx_o_values)):
         if not pd.isna(uid) and int(uid) in excluded_uids:
             continue
         key = None if pd.isna(uid) or pd.isna(idx_o) else (int(uid), int(idx_o))
-        if key not in ignored_points:
+        if segment_is_reviewable(traj_df, position, ignored_points):
             return position
     return 0
 
@@ -753,7 +796,7 @@ def next_nonignored_index(traj_df, ignored_points, current_idx, direction,
     while 0 <= target < len(traj_df):
         row = traj_df.iloc[target]
         if int(row["uid"]) not in excluded_uids \
-                and _annotation_key(row) not in ignored_points:
+                and segment_is_reviewable(traj_df, target, ignored_points):
             return target
         target += step
     return len(traj_df) if step > 0 else -1
@@ -1168,26 +1211,22 @@ class PathRenderer:
             self._uid_nav_index = {
                 int(uid): index for index, uid in enumerate(self._uid_nav_values)
             }
-            resolved_idx_by_uid = {}
-            for uid, point_idx in set(self.labeled_modes) | set(self.ignored_points):
-                resolved_idx_by_uid.setdefault(int(uid), set()).add(int(point_idx))
             self._uid_resolved_counts = {uid: 0 for uid in self._uid_segment_positions}
             self._uid_path_counts = {uid: 0 for uid in self._uid_segment_positions}
             for uid, _segment_id in self.labeled_paths:
                 uid = int(uid)
                 if uid in self._uid_path_counts:
                     self._uid_path_counts[uid] += 1
-            if "idx_o" in self.traj_df.columns:
-                for uid, resolved_indices in resolved_idx_by_uid.items():
-                    positions = self._uid_segment_positions.get(uid)
-                    if positions is None:
-                        continue
-                    idx_o_values = pd.to_numeric(
-                        self.traj_df.iloc[positions]["idx_o"], errors="coerce",
-                    ).to_numpy()
-                    self._uid_resolved_counts[uid] = int(
-                        np.isin(idx_o_values, tuple(resolved_indices)).sum()
+            resolved_keys = set(self.labeled_modes) | set(self.ignored_points)
+            for uid, positions in self._uid_segment_positions.items():
+                self._uid_resolved_counts[uid] = sum(
+                    _annotation_key(self.traj_df.iloc[int(position)])
+                    in resolved_keys
+                    or not segment_is_reviewable(
+                        self.traj_df, int(position), self.ignored_points,
                     )
+                    for position in positions
+                )
         else:
             self._uid_segment_positions = {}
             self._uid_nav_values = np.empty(0, dtype=np.int64)
@@ -1424,6 +1463,9 @@ class PathRenderer:
         self._uid_resolved_counts[uid] = sum(
             _annotation_key(self.traj_df.iloc[int(position)])
             in resolved_keys
+            or not segment_is_reviewable(
+                self.traj_df, int(position), self.ignored_points,
+            )
             for position in positions
         )
 
@@ -1437,20 +1479,58 @@ class PathRenderer:
                 return position
         return None
 
-    def _toggle_ignored_point(self, target):
+    def _uid_point_entries(self, uid):
+        """Return origin points plus the UID's otherwise-missing final point."""
+        positions = self._uid_segment_positions.get(
+            int(uid), np.empty(0, dtype=np.int32),
+        )
+        entries = []
+        for position in positions:
+            position = int(position)
+            key = _annotation_key(self.traj_df.iloc[position])
+            if key is not None:
+                entries.append({
+                    "position": position,
+                    "key": key,
+                    "destination": False,
+                })
+        if len(positions):
+            last_position = int(positions[-1])
+            terminal_key = _destination_annotation_key(
+                self.traj_df.iloc[last_position],
+            )
+            if terminal_key is not None \
+                    and (not entries or terminal_key != entries[-1]["key"]):
+                entries.append({
+                    "position": last_position,
+                    "key": terminal_key,
+                    "destination": True,
+                })
+        return entries
+
+    def _toggle_ignored_point(self, target, point_key=None, destination=False):
         """Ignore/restore one sampled point and invalidate changed adjacent ODs."""
         target = int(target)
         row = self.traj_df.iloc[target]
-        key = _annotation_key(row)
+        key = point_key or (
+            _destination_annotation_key(row) if destination else _annotation_key(row)
+        )
         if key is None:
             return
         was_ignored = key in self.ignored_points
-        previous_position = self._previous_nonignored_position(target)
+        if destination and _annotation_key(row) not in self.ignored_points:
+            previous_position = target
+        else:
+            previous_position = self._previous_nonignored_position(target)
         previous_key = (
             _annotation_key(self.traj_df.iloc[previous_position])
             if previous_position is not None else None
         )
-        affected_keys = {item for item in (key, previous_key) if item is not None}
+        affected_keys = {
+            item for item in (
+                (previous_key,) if destination else (key, previous_key)
+            ) if item is not None
+        }
         action = "restored" if was_ignored else "ignored"
 
         updated_points = set(self.ignored_points)
@@ -1498,7 +1578,12 @@ class PathRenderer:
 
         if self.segment_select_callback is None:
             return
-        if not was_ignored and target == self.current_idx:
+        current_became_unreviewable = (
+            not was_ignored
+            and destination
+            and previous_position == self.current_idx
+        )
+        if not was_ignored and (target == self.current_idx or current_became_unreviewable):
             next_target = next_nonignored_index(
                 self.traj_df, self.ignored_points, target, 1,
                 getattr(self, "excluded_uids", set()),
@@ -1513,7 +1598,7 @@ class PathRenderer:
         elif previous_position == self.current_idx:
             # The current OD endpoint changed because its next point was
             # ignored/restored; rebuild this view immediately.
-                self.segment_select_callback(self.current_idx)
+            self.segment_select_callback(self.current_idx)
 
     def _toggle_excluded_uid(self, uid):
         """Exclude/restore a complete UID trajectory from the dated copy."""
@@ -1713,15 +1798,16 @@ class PathRenderer:
             return None
         if getattr(self, "annotation_mode", ANNOTATION_MODE) == ANNOTATION_PATH:
             for position in positions:
-                if _annotation_key(self.traj_df.iloc[int(position)]) not in ignored_points:
+                if segment_is_reviewable(self.traj_df, int(position), ignored_points):
                     return int(position)
             return None
         for position in positions:
             key = _annotation_key(self.traj_df.iloc[int(position)])
-            if key not in self.labeled_modes and key not in ignored_points:
+            if key not in self.labeled_modes \
+                    and segment_is_reviewable(self.traj_df, int(position), ignored_points):
                 return int(position)
         for position in positions:
-            if _annotation_key(self.traj_df.iloc[int(position)]) not in ignored_points:
+            if segment_is_reviewable(self.traj_df, int(position), ignored_points):
                 return int(position)
         return None
 
@@ -1946,13 +2032,18 @@ class PathRenderer:
         positions = self._uid_segment_positions.get(
             self.state.uid, np.empty(0, dtype=np.int32),
         )
-        total = len(positions)
+        entries = self._uid_point_entries(self.state.uid)
+        total = len(entries)
         if not total:
             ax.text(0.5, 0.5, "当前 UID\n没有可用 OD", ha="center", va="center", fontsize=9)
             return
 
         local_matches = np.flatnonzero(positions == self.current_idx)
-        current_local = int(local_matches[0]) if len(local_matches) else 0
+        current_od_local = int(local_matches[0]) if len(local_matches) else 0
+        current_local = next((
+            index for index, entry in enumerate(entries)
+            if not entry["destination"] and entry["position"] == self.current_idx
+        ), 0)
         if self._uid_list_uid != self.state.uid:
             self._uid_list_uid = self.state.uid
             self._uid_list_offset = max(0, current_local - UID_LIST_VISIBLE_ROWS // 2)
@@ -1970,7 +2061,7 @@ class PathRenderer:
             list_title = (
                 f"UID {self.state.uid}\n"
                 f"路径段已存 {self._uid_path_counts.get(self.state.uid, 0)} | "
-                f"OD {current_local + 1}/{total}"
+                f"OD {current_od_local + 1}/{len(positions)} | 信令点 {total}"
             )
         else:
             list_title = (
@@ -1988,9 +2079,12 @@ class PathRenderer:
         ignored_xs, ignored_ys = [], []
         ignored_points = getattr(self, "ignored_points", set())
         for visible_row, local_index in enumerate(range(self._uid_list_offset, stop)):
-            global_index = int(positions[local_index])
+            entry = entries[local_index]
+            global_index = entry["position"]
             y = top - (visible_row + 0.5) * row_height
-            is_current = global_index == self.current_idx
+            is_current = (
+                not entry["destination"] and global_index == self.current_idx
+            )
             if is_current:
                 ax.add_patch(Rectangle(
                     (0.025, y - row_height * 0.46), 0.925, row_height * 0.92,
@@ -1998,10 +2092,10 @@ class PathRenderer:
                     edgecolor="#4c91d9", linewidth=1.0, zorder=0,
                 ))
 
-            row = self.traj_df.iloc[global_index]
-            key = _annotation_key(row)
+            key = entry["key"]
             is_ignored = key in ignored_points
-            mode = None if is_ignored else self.labeled_modes.get(key)
+            mode = None if is_ignored or entry["destination"] \
+                else self.labeled_modes.get(key)
             dot_color = LABELED_POINT_COLORS.get(mode)
             if is_ignored:
                 ignored_xs.append(0.14)
@@ -2037,7 +2131,7 @@ class PathRenderer:
                     color=dot_color, fontweight="bold", transform=ax.transAxes,
                 )
             self._uid_list_hit_rows.append((
-                y - row_height * 0.5, y + row_height * 0.5, global_index,
+                y - row_height * 0.5, y + row_height * 0.5, entry,
             ))
 
         if dot_xs:
@@ -2078,10 +2172,8 @@ class PathRenderer:
     def _on_uid_list_scroll(self, event):
         if event.inaxes is not self.ax_uid_list:
             return
-        positions = self._uid_segment_positions.get(
-            self.state.uid, np.empty(0, dtype=np.int32),
-        )
-        max_offset = max(0, len(positions) - UID_LIST_VISIBLE_ROWS)
+        entries = self._uid_point_entries(self.state.uid)
+        max_offset = max(0, len(entries) - UID_LIST_VISIBLE_ROWS)
         if max_offset <= 0:
             return
 
@@ -2101,12 +2193,20 @@ class PathRenderer:
             return
         if event.button not in (1, 3):
             return
-        for y_min, y_max, target in self._uid_list_hit_rows:
+        for y_min, y_max, entry in self._uid_list_hit_rows:
             if y_min <= event.ydata <= y_max:
-                key = _annotation_key(self.traj_df.iloc[int(target)])
+                target = entry["position"]
+                key = entry["key"]
                 if event.button == 3:
-                    self._toggle_ignored_point(target)
-                elif key not in getattr(self, "ignored_points", set()) \
+                    self._toggle_ignored_point(
+                        target, point_key=key,
+                        destination=entry["destination"],
+                    )
+                elif not entry["destination"] \
+                        and segment_is_reviewable(
+                            self.traj_df, target,
+                            getattr(self, "ignored_points", set()),
+                        ) \
                         and target != self.current_idx \
                         and self.segment_select_callback is not None:
                     self.segment_select_callback(target)
@@ -2581,7 +2681,7 @@ class PathRenderer:
         if ignored_points:
             uid_positions = np.asarray([
                 int(position) for position in uid_positions
-                if _annotation_key(traj_df.iloc[int(position)]) not in ignored_points
+                if segment_is_reviewable(traj_df, int(position), ignored_points)
             ], dtype=np.int32)
         previous_positions = uid_positions[uid_positions < idx]
         next_positions = uid_positions[uid_positions > idx]
@@ -3379,6 +3479,13 @@ class LabelController:
         if isinstance(ignored_points, (set, frozenset)) \
                 and current_key in ignored_points:
             print("  [IGNORED] Restore this point before labeling its OD")
+            return False
+        traj_df = getattr(self.renderer, "traj_df", None)
+        if isinstance(traj_df, pd.DataFrame) \
+                and not segment_is_reviewable(
+                    traj_df, self.current_idx, ignored_points,
+                ):
+            print("  [IGNORED] Restore the OD endpoint before labeling this OD")
             return False
         excluded_uids = getattr(self.renderer, "excluded_uids", set())
         if isinstance(excluded_uids, (set, frozenset)) \
