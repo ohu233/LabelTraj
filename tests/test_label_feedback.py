@@ -1,6 +1,8 @@
 import unittest
+import json
 from unittest import mock
 
+import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -25,6 +27,122 @@ class LabelFeedbackTest(unittest.TestCase):
     def test_missing_label_file_returns_empty_feedback(self):
         with mock.patch.object(LabelPath.os.path, "exists", return_value=False):
             self.assertEqual(LabelPath.load_labeled_modes("unused"), {})
+
+    def test_loads_only_valid_saved_paths(self):
+        labeled = pd.DataFrame([
+            {"uid": 11, "segment_id": 1, "mode": "TG", "idx_o": 3,
+             "idx_d": 6, "traj": "[[1, -1, 0], [2, -2, 0]]"},
+            {"uid": 11, "segment_id": 2, "mode": "TS", "idx_o": 6,
+             "idx_d": 8, "traj": ""},
+            {"uid": 11, "segment_id": 3, "mode": "GG", "idx_o": 8,
+             "idx_d": 9, "traj": "not-json"},
+        ])
+        with mock.patch.object(LabelPath.os.path, "exists", return_value=True), \
+             mock.patch.object(LabelPath.pd, "read_csv", return_value=labeled):
+            paths, modes = LabelPath.load_labeled_path_data("unused")
+
+        self.assertEqual(
+            paths, {(11, 1): [(1, -1, 0), (2, -2, 0)]},
+        )
+        self.assertEqual(modes, {(11, 1): "TG"})
+
+    def test_loads_saved_path_window_metadata(self):
+        labeled = pd.DataFrame([
+            {"uid": 11, "segment_id": 1, "anchor_idx_o": 25,
+             "steps": 50, "match": 1.0},
+            {"uid": 11, "segment_id": 2, "anchor_idx_o": 53,
+             "steps": 83, "match": 0.95},
+        ])
+        with mock.patch.object(LabelPath.os.path, "exists", return_value=True), \
+             mock.patch.object(LabelPath.pd, "read_csv", return_value=labeled):
+            result = LabelPath.load_labeled_path_metadata("unused")
+
+        self.assertEqual(result[(11, 1)]["anchor_idx_o"], 25)
+        self.assertEqual(result[(11, 2)]["steps"], 83)
+        self.assertAlmostEqual(result[(11, 2)]["match"], 0.95)
+
+    def test_user_selected_boundaries_and_road_modes_are_stored_per_segment(self):
+        output_dir = LabelPath.os.path.join(
+            LabelPath.os.getcwd(), "tests", "_runtime_path_output",
+        )
+        path_csv = LabelPath.os.path.join(output_dir, LabelPath.PATH_LABEL_FILENAME)
+        try:
+            _, first_key = LabelPath.write_truth_path_segment(
+                output_dir, 7, "TG", 3,
+                [(0, 0, 0), (1, -1, 0)], 1.0, 1,
+            )
+            _, second_key = LabelPath.write_truth_path_segment(
+                output_dir, 7, "TG", 4,
+                [(1, -1, 0), (2, -2, 0)], 1.0, 1,
+            )
+            _, third_key = LabelPath.write_truth_path_segment(
+                output_dir, 7, "GG", 5,
+                [(2, -2, 0), (3, -3, 0)], 1.0, 1,
+            )
+
+            saved = pd.read_csv(path_csv)
+            self.assertEqual(first_key, (7, 1))
+            self.assertEqual(second_key, (7, 2))
+            self.assertEqual(third_key, (7, 3))
+            self.assertEqual(saved["segment_id"].tolist(), [1, 2, 3])
+            self.assertEqual(saved["mode"].tolist(), ["TG", "TG", "GG"])
+        finally:
+            for suffix in ("", ".tmp"):
+                target = path_csv + suffix
+                if LabelPath.os.path.exists(target):
+                    LabelPath.os.remove(target)
+
+    def test_saved_path_can_be_replaced_then_deleted_with_uid_renumbering(self):
+        output_dir = LabelPath.os.path.join(
+            LabelPath.os.getcwd(), "tests", "_runtime_path_output",
+        )
+        path_csv = LabelPath.os.path.join(output_dir, LabelPath.PATH_LABEL_FILENAME)
+        try:
+            _, first_key = LabelPath.write_truth_path_segment(
+                output_dir, 7, "TG", 3,
+                [(0, 0, 0), (1, -1, 0)], 1.0, 1,
+            )
+            _, second_key = LabelPath.write_truth_path_segment(
+                output_dir, 7, "GG", 4,
+                [(2, -2, 0), (3, -3, 0)], 1.0, 1,
+            )
+            LabelPath.write_truth_path_segment(
+                output_dir, 8, "TS", 1,
+                [(9, -9, 0), (10, -10, 0)], 1.0, 1,
+            )
+
+            _, replaced_key = LabelPath.write_truth_path_segment(
+                output_dir, 7, "DT", 8,
+                [(4, -4, 0), (5, -5, 0), (6, -6, 0)], 0.9, 2,
+                segment_key=first_key,
+            )
+            saved = pd.read_csv(path_csv)
+            saved = saved.loc[saved["uid"] == 7].sort_values("segment_id")
+            self.assertEqual(replaced_key, first_key)
+            self.assertEqual(saved["segment_id"].tolist(), [1, 2])
+            self.assertEqual(saved["mode"].tolist(), ["DT", "GG"])
+            self.assertEqual(int(saved.iloc[0]["anchor_idx_o"]), 8)
+            self.assertEqual(
+                json.loads(saved.iloc[0]["traj"]),
+                [[4, -4, 0], [5, -5, 0], [6, -6, 0]],
+            )
+
+            _, deleted_count = LabelPath.delete_truth_path_segment(
+                output_dir, first_key,
+            )
+            remaining = pd.read_csv(path_csv).sort_values(["uid", "segment_id"])
+            self.assertEqual(deleted_count, 1)
+            self.assertEqual(
+                remaining[["uid", "segment_id"]].values.tolist(),
+                [[7, 1], [8, 1]],
+            )
+            self.assertEqual(remaining["mode"].tolist(), ["GG", "TS"])
+            self.assertEqual(second_key, (7, 2))
+        finally:
+            for suffix in ("", ".tmp"):
+                target = path_csv + suffix
+                if LabelPath.os.path.exists(target):
+                    LabelPath.os.remove(target)
 
     def test_startup_opens_first_unlabeled_od_without_prompt(self):
         traj_df = pd.DataFrame([
@@ -79,6 +197,35 @@ class LabelFeedbackTest(unittest.TestCase):
         )
         self.assertEqual(
             LabelPath.next_nonignored_index(traj_df, set(), 0, 1, {10}), 2,
+        )
+
+    def test_path_navigation_uses_regular_od_order_without_mode_requirement(self):
+        traj_df = pd.DataFrame([
+            {"uid": 10, "idx_o": 0, "idx_d": 1},
+            {"uid": 10, "idx_o": 1, "idx_d": 2},
+            {"uid": 10, "idx_o": 2, "idx_d": 3},
+            {"uid": 20, "idx_o": 0, "idx_d": 1},
+        ])
+        self.assertEqual(LabelPath.next_nonignored_index(
+            traj_df, {(10, 1)}, 0, 1,
+        ), 2)
+        self.assertEqual(LabelPath.next_nonignored_index(
+            traj_df, set(), 2, 1,
+        ), 3)
+
+    def test_auto_route_finds_shortest_connected_mode_road_path(self):
+        road_cells = {
+            (0, 0, 0), (1, -1, 0), (2, -2, 0), (3, -3, 0),
+            (1, 0, -1), (2, -1, -1),
+        }
+
+        self.assertEqual(
+            LabelPath.find_road_route((0, 0, 0), (3, -3, 0), road_cells),
+            [(0, 0, 0), (1, -1, 0), (2, -2, 0), (3, -3, 0)],
+        )
+        self.assertEqual(
+            LabelPath.nearest_road_hex((0, 1, -1), road_cells),
+            (0, 0, 0),
         )
 
     def test_dated_copy_uses_dataset_date_and_excludes_uid_without_main_mutation(self):
@@ -175,6 +322,7 @@ class LabelFeedbackTest(unittest.TestCase):
         )
         artifact_names = (
             "traj_labeled.csv",
+            LabelPath.PATH_LABEL_FILENAME,
             LabelPath.IGNORED_POINT_FILENAME,
         )
         for name in artifact_names:
@@ -194,6 +342,9 @@ class LabelFeedbackTest(unittest.TestCase):
             renderer.output_dir = output_dir
             renderer.ignored_points = set()
             renderer.labeled_modes = {(7, 0): "TG", (7, 1): "TS", (7, 2): "GG"}
+            renderer.labeled_paths = {}
+            renderer.export_date = None
+            renderer.excluded_uids = set()
             renderer._uid_segment_positions = {7: np.asarray([0, 1, 2])}
             renderer._uid_resolved_counts = {7: 3}
             renderer.current_idx = 2
@@ -242,7 +393,7 @@ class LabelFeedbackTest(unittest.TestCase):
         active_path = LabelPath.os.path.join(output_dir, "traj_labeled.csv")
         try:
             pd.DataFrame([
-                {"uid": 7, "idx_o": 1, "idx_d": 2, "mode": "TS"},
+                {"uid": 7, "idx_o": 1, "idx_d": 2, "mode": "TS", "path": "old"},
                 {"uid": 7, "idx_o": 0, "idx_d": 1, "mode": "TG"},
                 {"uid": 6, "idx_o": 9, "idx_d": 10, "mode": "GG"},
             ]).to_csv(active_path, index=False)
@@ -251,6 +402,8 @@ class LabelFeedbackTest(unittest.TestCase):
 
             self.assertEqual(reordered, 1)
             active = pd.read_csv(active_path)
+            self.assertNotIn("traj", active.columns)
+            self.assertNotIn("path", active.columns)
             self.assertEqual(
                 list(active[["uid", "idx_o", "idx_d"]].itertuples(
                     index=False, name=None,
@@ -349,11 +502,12 @@ class LabelFeedbackTest(unittest.TestCase):
         renderer._road_hover.set_visible(False)
         hex_key = (1, -2, 1)
         renderer.raw_mapdata = {
-            hex_key: {"code": (1 << 12) | (1 << 9)},  # TG + GG
+            hex_key: {"code": (1 << 12) | (1 << 9) | (1 << 5)},  # TG + GG + L2
         }
         renderer.road_sets = {}
         renderer.road_visibility = {
-            mode: mode != "TG" for mode in LabelPath.MODE_LIST
+            mode: mode not in {"TG", "L2"}
+            for mode in LabelPath.DISPLAY_MODE_LIST
         }
         renderer._hovered_hex_from_event = mock.Mock(return_value=hex_key)
         event = mock.Mock(inaxes=renderer.ax, xdata=4.0, ydata=5.0)
@@ -363,8 +517,14 @@ class LabelFeedbackTest(unittest.TestCase):
         self.assertTrue(renderer._road_hover.get_visible())
         self.assertIn("[GG]高速", renderer._road_hover.get_text())
         self.assertNotIn("TG", renderer._road_hover.get_text())
+        self.assertNotIn("L2", renderer._road_hover.get_text())
+
+        renderer.road_visibility["L2"] = True
+        renderer._on_poi_hover(event)
+        self.assertIn("[L2]二级公路", renderer._road_hover.get_text())
 
         renderer.road_visibility["GG"] = False
+        renderer.road_visibility["L2"] = False
         renderer._on_poi_hover(event)
         self.assertFalse(renderer._road_hover.get_visible())
         plt.close(renderer.fig)
@@ -442,20 +602,38 @@ class LabelFeedbackTest(unittest.TestCase):
         self.assertTrue(all(0.0 < gap <= 0.025 for gap in gaps))
         plt.close(renderer.fig)
 
+    def test_l2_is_display_only_road_layer(self):
+        hex_key = (1, -2, 1)
+        road_sets = LabelPath.hex_mapdata_to_road_sets({
+            hex_key: {"code": 1 << 5},
+        })
+
+        self.assertIn("L2", LabelPath.DISPLAY_MODE_LIST)
+        self.assertNotIn("L2", LabelPath.MODE_LIST)
+        self.assertEqual(road_sets["L2"], {hex_key})
+        self.assertTrue(all(
+            hex_key not in road_sets[mode] for mode in LabelPath.MODE_LIST
+        ))
+
     def test_road_buttons_toggle_layer_without_rescaling_and_persist_on_redraw(self):
         renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
         renderer.fig, renderer.ax = plt.subplots()
         renderer.ax_info = renderer.ax
-        renderer.road_visibility = {mode: True for mode in LabelPath.MODE_LIST}
+        renderer.road_visibility = {
+            mode: mode != "L2" for mode in LabelPath.DISPLAY_MODE_LIST
+        }
         renderer._road_artists = {}
         renderer._road_buttons = {}
         renderer._init_road_toggle_buttons()
 
         button_positions = [
-            renderer._road_buttons[mode].ax.get_position() for mode in LabelPath.MODE_LIST
+            renderer._road_buttons[mode].ax.get_position()
+            for mode in LabelPath.DISPLAY_MODE_LIST
         ]
         self.assertEqual(len({round(position.x0, 6) for position in button_positions}), 1)
-        self.assertEqual(len({round(position.y0, 6) for position in button_positions}), 5)
+        self.assertEqual(len({round(position.y0, 6) for position in button_positions}), 6)
+        self.assertFalse(renderer.road_visibility["L2"])
+        self.assertIn("关", renderer._road_buttons["L2"].label.get_text())
 
         renderer.ax.set_xlim(10, 20)
         renderer.ax.set_ylim(30, 40)
@@ -470,6 +648,15 @@ class LabelFeedbackTest(unittest.TestCase):
         self.assertIn("关", renderer._road_buttons["TG"].label.get_text())
         self.assertEqual((renderer.ax.get_xlim(), renderer.ax.get_ylim()), before)
 
+        l2_artist = renderer.ax.scatter([16], [36])
+        l2_artist.set_visible(False)
+        renderer._road_artists["L2"] = l2_artist
+        renderer._toggle_road_layer("L2")
+        self.assertTrue(renderer.road_visibility["L2"])
+        self.assertTrue(l2_artist.get_visible())
+        self.assertIn("开", renderer._road_buttons["L2"].label.get_text())
+        self.assertEqual((renderer.ax.get_xlim(), renderer.ax.get_ylim()), before)
+
         renderer._road_artists = {}
         renderer._road_display = {
             "TG": (
@@ -481,8 +668,50 @@ class LabelFeedbackTest(unittest.TestCase):
         renderer._my_min, renderer._my_max = 30, 40
         renderer._build_hex_road_overlay(None)
 
-        self.assertFalse(renderer._road_artists["TG"].get_visible())
+        self.assertNotIn("TG", renderer._road_artists)
         self.assertEqual((renderer.ax.get_xlim(), renderer.ax.get_ylim()), before)
+        plt.close(renderer.fig)
+
+    def test_path_mode_keeps_exactly_one_road_network_active(self):
+        renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+        renderer.fig, renderer.ax = plt.subplots()
+        renderer.annotation_mode = LabelPath.ANNOTATION_PATH
+        renderer.active_path_mode = None
+        renderer.road_visibility = {
+            mode: True for mode in LabelPath.DISPLAY_MODE_LIST
+        }
+        renderer.road_sets = {
+            mode: {(index, -index, 0)}
+            for index, mode in enumerate(LabelPath.DISPLAY_MODE_LIST, 1)
+        }
+        renderer.state = mock.Mock(path_history=[(0, 0, 0)])
+        renderer._road_artists = {
+            mode: renderer.ax.scatter([index], [index])
+            for index, mode in enumerate(LabelPath.DISPLAY_MODE_LIST, 1)
+        }
+        renderer._road_buttons = {}
+        renderer._road_hover = None
+        renderer.path_line = mock.Mock()
+        renderer.refresh = mock.Mock()
+
+        renderer.set_active_path_mode("TG")
+
+        self.assertEqual(renderer.active_path_mode, "TG")
+        self.assertIs(renderer.state.multi_mapdata, renderer.road_sets["TG"])
+        self.assertEqual(
+            [mode for mode, visible in renderer.road_visibility.items() if visible],
+            ["TG"],
+        )
+        renderer.state.clear_path.assert_called_once_with()
+
+        renderer.state.path_history = [(1, -1, 0)]
+        renderer.set_active_path_mode("GG")
+        self.assertEqual(
+            [mode for mode, visible in renderer.road_visibility.items() if visible],
+            ["GG"],
+        )
+        self.assertFalse(renderer.road_visibility["L2"])
+        self.assertEqual(renderer.state.clear_path.call_count, 2)
         plt.close(renderer.fig)
 
     def test_clickable_label_buttons_show_1_to_6_mapping_and_share_callback(self):
@@ -498,6 +727,23 @@ class LabelFeedbackTest(unittest.TestCase):
             self.assertTrue(renderer._label_buttons[mode].label.get_text().startswith(f"{key}  {mode}"))
         renderer._request_label_mode("GSD")
         renderer.label_select_callback.assert_called_once_with("GSD")
+        plt.close(renderer.fig)
+
+    def test_single_button_switches_between_mode_and_path_workflows(self):
+        renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+        renderer.fig = plt.figure()
+        renderer.annotation_mode = LabelPath.ANNOTATION_MODE
+        renderer.annotation_toggle_callback = mock.Mock()
+        renderer._annotation_toggle_button = None
+
+        renderer._init_annotation_toggle_button()
+        self.assertIn("模式标注", renderer._annotation_toggle_button.label.get_text())
+        renderer._request_annotation_toggle()
+        renderer.annotation_toggle_callback.assert_called_once_with()
+
+        renderer.annotation_mode = LabelPath.ANNOTATION_PATH
+        renderer._update_annotation_toggle_style()
+        self.assertIn("路径标注", renderer._annotation_toggle_button.label.get_text())
         plt.close(renderer.fig)
 
     def test_uid_od_list_uses_saved_mode_colors_and_highlights_current_row(self):
@@ -574,7 +820,87 @@ class LabelFeedbackTest(unittest.TestCase):
         renderer._toggle_ignored_point.assert_called_once_with(target)
         plt.close(renderer.fig)
 
-    def test_uid_navigation_uses_solid_dot_only_for_completed_uid(self):
+    def test_saved_path_list_scrolls_and_opens_recorded_window(self):
+        renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+        renderer.fig, renderer.ax_path_list = plt.subplots()
+        renderer.state = mock.Mock(uid=7)
+        renderer.current_idx = 0
+        renderer.traj_df = pd.DataFrame([
+            {"uid": 7, "idx_o": 100 + index} for index in range(35)
+        ])
+        renderer._uid_segment_positions = {7: np.arange(35, dtype=np.int32)}
+        renderer.labeled_paths = {
+            (7, segment_id): [(0, 0, 0), (1, -1, 0)]
+            for segment_id in range(1, 36)
+        }
+        renderer.labeled_path_modes = {
+            key: ("TG" if key[1] % 2 else "GG")
+            for key in renderer.labeled_paths
+        }
+        renderer.labeled_path_metadata = {
+            (7, segment_id): {
+                "anchor_idx_o": 99 + segment_id,
+                "steps": segment_id,
+            }
+            for segment_id in range(1, 36)
+        }
+        renderer.selected_path_key = None
+        renderer.annotation_mode = LabelPath.ANNOTATION_PATH
+        renderer.set_active_path_mode = mock.Mock()
+        renderer._path_list_uid = None
+        renderer._path_list_offset = 0
+        renderer._path_list_hit_rows = []
+        renderer.segment_select_callback = mock.Mock()
+        renderer._draw_uid_path_list(ensure_current=True)
+
+        renderer._on_path_list_scroll(mock.Mock(
+            inaxes=renderer.ax_path_list, step=-1, button="down",
+        ))
+        self.assertEqual(renderer._path_list_offset, LabelPath.PATH_LIST_SCROLL_STEP)
+
+        y_min, y_max, key = renderer._path_list_hit_rows[0]
+        renderer._on_path_list_click(mock.Mock(
+            inaxes=renderer.ax_path_list,
+            ydata=(y_min + y_max) / 2,
+            button=1,
+        ))
+
+        self.assertEqual(key, (7, 6))
+        self.assertEqual(renderer.selected_path_key, key)
+        renderer.set_active_path_mode.assert_called_once_with("GG")
+        renderer.segment_select_callback.assert_called_once_with(5)
+        plt.close(renderer.fig)
+
+    def test_saved_path_in_memory_keys_are_compacted_for_one_uid(self):
+        renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+        renderer.labeled_paths = {
+            (7, 2): [(0, 0, 0)],
+            (7, 4): [(1, -1, 0)],
+            (8, 3): [(2, -2, 0)],
+        }
+        renderer.labeled_path_modes = {
+            (7, 2): "TG", (7, 4): "GG", (8, 3): "TS",
+        }
+        renderer.labeled_path_metadata = {
+            (7, 2): {"steps": 1},
+            (7, 4): {"steps": 2},
+            (8, 3): {"steps": 3},
+        }
+        renderer.selected_path_key = (7, 4)
+        renderer.editing_path_key = (7, 2)
+
+        key_remap = renderer.renumber_labeled_paths(7)
+
+        self.assertEqual(key_remap, {(7, 2): (7, 1), (7, 4): (7, 2)})
+        self.assertEqual(
+            set(renderer.labeled_paths), {(7, 1), (7, 2), (8, 3)},
+        )
+        self.assertEqual(renderer.labeled_path_modes[(7, 2)], "GG")
+        self.assertEqual(renderer.labeled_path_metadata[(7, 1)]["steps"], 1)
+        self.assertEqual(renderer.selected_path_key, (7, 2))
+        self.assertEqual(renderer.editing_path_key, (7, 1))
+
+    def test_uid_navigation_distinguishes_od_completion_and_saved_paths(self):
         traj_df = pd.DataFrame([
             {"uid": uid, "idx_o": idx_o}
             for uid in (10, 20, 30)
@@ -594,6 +920,7 @@ class LabelFeedbackTest(unittest.TestCase):
         renderer._uid_nav_values = np.asarray([10, 20, 30])
         renderer._uid_nav_index = {10: 0, 20: 1, 30: 2}
         renderer._uid_resolved_counts = {10: 2, 20: 1, 30: 0}
+        renderer._uid_path_counts = {10: 0, 20: 1, 30: 2}
         renderer.excluded_uids = {30}
         renderer._uid_nav_offset = 0
         renderer._uid_nav_hit_rows = []
@@ -604,7 +931,14 @@ class LabelFeedbackTest(unittest.TestCase):
         self.assertEqual(facecolors[0, 3], 1.0)
         self.assertEqual(facecolors[1, 3], 0.0)
         self.assertEqual(len(facecolors), 2)
-        self.assertEqual(len(renderer.ax_uid_nav.collections[1].get_offsets()), 1)
+        path_markers = renderer.ax_uid_nav.collections[1]
+        self.assertEqual(len(path_markers.get_offsets()), 2)
+        self.assertTrue(np.allclose(
+            path_markers.get_facecolors()[0, :3],
+            matplotlib.colors.to_rgb("#00a7b5"),
+        ))
+        self.assertEqual(len(renderer.ax_uid_nav.collections[2].get_offsets()), 1)
+        self.assertIn("◆ 有路径", renderer.ax_uid_nav.texts[0].get_text())
         self.assertTrue(any(patch.get_edgecolor()[2] > 0.7
                             for patch in renderer.ax_uid_nav.patches))
         plt.close(renderer.fig)
@@ -665,6 +999,408 @@ class LabelFeedbackTest(unittest.TestCase):
         finalize.assert_called_once_with("TG")
         navigate.assert_called_once_with(1)
         close.assert_not_called()
+
+    def test_path_workflow_disables_mode_keys_and_enter_saves_path(self):
+        row = pd.Series({"uid": 7, "idx_o": 3})
+        state = mock.Mock(
+            row=row, uid=7,
+            path_history=[(0, 0, 0), (1, -1, 0)], step_count=1,
+        )
+        renderer = mock.Mock(
+            labeled_modes={(7, 3): "TG"}, labeled_paths={},
+            ignored_points=set(), excluded_uids=set(),
+            active_path_mode="TG",
+        )
+        navigate = mock.Mock()
+        controller = LabelPath.LabelController(
+            state, renderer, "unused", batch_mode=True, current_idx=4,
+            navigate_callback=navigate,
+        )
+        controller.annotation_mode = LabelPath.ANNOTATION_PATH
+        renderer.annotation_mode = LabelPath.ANNOTATION_PATH
+
+        with mock.patch.object(controller, "_finalize") as finalize_mode, \
+             mock.patch.object(
+                 controller, "_finalize_path", return_value=(7, 1),
+             ) as finalize_path:
+            controller.on_key(mock.Mock(key="1"))
+            controller.on_key(mock.Mock(key="enter"))
+
+        finalize_mode.assert_not_called()
+        finalize_path.assert_called_once_with("TG")
+        navigate.assert_not_called()
+        state.clear_path.assert_called_once_with()
+        renderer.show_segment.assert_called_once_with(state, 4)
+
+    def test_r_resets_selected_saved_path_for_in_place_redraw(self):
+        state = mock.Mock(
+            uid=7, row=pd.Series({"uid": 7, "idx_o": 3}), path_history=[],
+        )
+        renderer = mock.Mock(
+            labeled_paths={(7, 2): [(0, 0, 0), (1, -1, 0)]},
+            selected_path_key=(7, 2), editing_path_key=None,
+        )
+        controller = LabelPath.LabelController(
+            state, renderer, "unused", batch_mode=True, current_idx=4,
+        )
+        controller.annotation_mode = LabelPath.ANNOTATION_PATH
+        renderer.annotation_mode = LabelPath.ANNOTATION_PATH
+
+        controller.on_key(mock.Mock(key="r"))
+
+        self.assertEqual(renderer.editing_path_key, (7, 2))
+        state.clear_path.assert_called_once_with()
+        renderer.show_segment.assert_called_once_with(state, 4)
+
+    def test_backspace_deletes_selected_path_only_when_no_route_is_pending(self):
+        state = mock.Mock(
+            uid=7, row=pd.Series({"uid": 7, "idx_o": 3}), path_history=[],
+        )
+        renderer = mock.Mock(
+            labeled_paths={(7, 2): [(0, 0, 0), (1, -1, 0)]},
+            selected_path_key=(7, 2), editing_path_key=None,
+            export_date="20260811", excluded_uids=set(),
+        )
+        controller = LabelPath.LabelController(
+            state, renderer, "unused", batch_mode=True, current_idx=4,
+        )
+        controller.annotation_mode = LabelPath.ANNOTATION_PATH
+        renderer.annotation_mode = LabelPath.ANNOTATION_PATH
+
+        with mock.patch.object(
+            LabelPath, "delete_truth_path_segment", return_value=("paths.csv", 1),
+        ) as delete_path, mock.patch.object(
+            controller, "_refresh_path_copy",
+        ) as refresh_copy:
+            controller.on_key(mock.Mock(key="backspace"))
+
+        delete_path.assert_called_once_with("unused", (7, 2))
+        renderer.clear_labeled_path.assert_called_once_with((7, 2))
+        renderer.renumber_labeled_paths.assert_called_once_with(7)
+        refresh_copy.assert_called_once_with()
+        renderer.show_segment.assert_called_once_with(state, 4)
+
+    def test_backspace_clears_pending_route_before_touching_selected_path(self):
+        state = mock.Mock(
+            uid=7, row=pd.Series({"uid": 7, "idx_o": 3}),
+            path_history=[(0, 0, 0), (1, -1, 0)],
+        )
+        renderer = mock.Mock(
+            labeled_paths={(7, 2): [(2, -2, 0), (3, -3, 0)]},
+            selected_path_key=(7, 2), editing_path_key=None,
+        )
+        controller = LabelPath.LabelController(
+            state, renderer, "unused", batch_mode=True, current_idx=4,
+        )
+        controller.annotation_mode = LabelPath.ANNOTATION_PATH
+
+        with mock.patch.object(LabelPath, "delete_truth_path_segment") as delete_path:
+            controller.on_key(mock.Mock(key="backspace"))
+
+        state.set_path_start.assert_called_once_with((0, 0, 0))
+        delete_path.assert_not_called()
+
+    def test_path_uses_active_road_network_and_starts_with_no_forced_path(self):
+        row = pd.Series({
+            "uid": 7, "idx_o": 3, "order": 7, "mode": "",
+            "x_o": 0, "y_o": 0, "z_o": 0,
+            "x_d": 2, "y_d": -2, "z_d": 0,
+        })
+        all_roads = {(9, -9, 0)}
+        tg_roads = {(5, -5, 0), (6, -6, 0)}
+        state = LabelPath.LabelState(row, all_roads)
+        renderer = mock.Mock(
+            labeled_modes={(7, 3): "TG"},
+            labeled_paths={(7, 1): [(5, -5, 0), (6, -6, 0)]},
+            active_path_mode="TG",
+            road_sets={"TG": tg_roads},
+        )
+        controller = LabelPath.LabelController(
+            state, renderer, "unused", batch_mode=True, current_idx=4,
+        )
+        controller.annotation_mode = LabelPath.ANNOTATION_PATH
+        controller._prepare_state_for_workflow()
+
+        self.assertIs(state.multi_mapdata, tg_roads)
+        self.assertEqual(state.path_history, [])
+        self.assertEqual(state.step_count, 0)
+
+    def test_manual_path_start_is_selected_on_map_not_forced_to_signal(self):
+        row = pd.Series({
+            "uid": 7, "idx_o": 3, "order": 7, "mode": "",
+            "x_o": 0, "y_o": 0, "z_o": 0,
+            "x_d": 2, "y_d": -2, "z_d": 0,
+        })
+        road_cells = {(5, -5, 0), (6, -6, 0)}
+        state = LabelPath.LabelState(
+            row, road_cells,
+            hex_grid={(5, -5, 0): {}, (6, -6, 0): {}},
+        )
+        renderer = mock.Mock(labeled_paths={}, labeled_modes={(7, 3): "TG"})
+        controller = LabelPath.LabelController(
+            state, renderer, "unused", batch_mode=True, current_idx=4,
+        )
+        controller.annotation_mode = LabelPath.ANNOTATION_PATH
+        state.clear_path()
+
+        self.assertTrue(controller.select_path_start((5, -5, 0)))
+        self.assertEqual(state.cur, (5, -5, 0))
+        self.assertEqual(state.path_history, [(5, -5, 0)])
+        self.assertNotEqual(state.path_history[0], state.start)
+        renderer.refresh.assert_called_once_with()
+
+        self.assertTrue(controller.select_path_start((6, -6, 0)))
+        self.assertEqual(state.path_history, [(5, -5, 0), (6, -6, 0)])
+        controller.on_key(mock.Mock(key="backspace"))
+        self.assertEqual(state.path_history, [(5, -5, 0)])
+
+    def test_main_view_left_click_requests_manual_path_start(self):
+        renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+        renderer.fig, renderer.ax = plt.subplots()
+        renderer.annotation_mode = LabelPath.ANNOTATION_PATH
+        renderer.path_start_select_callback = mock.Mock()
+        event = mock.Mock(inaxes=renderer.ax, button=1, xdata=10.0, ydata=20.0)
+
+        with mock.patch.object(
+                renderer, "_hovered_hex_from_event", return_value=(5, -5, 0)):
+            renderer._on_main_view_click(event)
+
+        renderer.path_start_select_callback.assert_called_once_with((5, -5, 0))
+        plt.close(renderer.fig)
+
+    def test_saved_paths_for_current_uid_are_drawn_without_rescaling(self):
+        renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+        renderer.fig, renderer.ax = plt.subplots()
+        renderer.annotation_mode = LabelPath.ANNOTATION_MODE
+        renderer.labeled_paths = {
+            (7, 1): [(0, 0, 0), (1, -1, 0)],
+            (8, 1): [(2, -2, 0), (3, -3, 0)],
+        }
+        renderer.labeled_path_modes = {(7, 1): "TG", (8, 1): "GG"}
+        state = mock.Mock(uid=7, row=pd.Series({"uid": 7, "idx_o": 0}))
+        renderer.ax.set_xlim(10, 20)
+        renderer.ax.set_ylim(30, 40)
+        before = renderer.ax.get_xlim(), renderer.ax.get_ylim()
+
+        with mock.patch.object(
+                LabelPath, "hex_to_mercator",
+                return_value=(np.asarray([11.0, 12.0]), np.asarray([31.0, 32.0]))), \
+             mock.patch.object(
+                 LabelPath, "mercator_wgs84_to_gcj02",
+                 side_effect=lambda x, y: (np.asarray(x), np.asarray(y))):
+            renderer._draw_saved_paths(state)
+
+        self.assertEqual(len(renderer.ax.collections), 3)
+        self.assertEqual((renderer.ax.get_xlim(), renderer.ax.get_ylim()), before)
+        plt.close(renderer.fig)
+
+    def test_selected_saved_path_is_emphasized_instead_of_latest(self):
+        renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+        renderer.fig, renderer.ax = plt.subplots()
+        renderer.annotation_mode = LabelPath.ANNOTATION_PATH
+        renderer.labeled_paths = {
+            (7, 1): [(0, 0, 0), (1, -1, 0)],
+            (7, 2): [(1, -1, 0), (2, -2, 0)],
+        }
+        renderer.labeled_path_modes = {
+            (7, 1): "TG", (7, 2): "GG",
+        }
+        renderer.selected_path_key = (7, 1)
+        state = mock.Mock(uid=7)
+        renderer.ax.set_xlim(10, 20)
+        renderer.ax.set_ylim(30, 40)
+        before = renderer.ax.get_xlim(), renderer.ax.get_ylim()
+
+        with mock.patch.object(
+                LabelPath, "hex_to_mercator",
+                return_value=(np.asarray([11.0, 12.0]), np.asarray([31.0, 32.0]))), \
+             mock.patch.object(
+                 LabelPath, "mercator_wgs84_to_gcj02",
+                 side_effect=lambda x, y: (np.asarray(x), np.asarray(y))):
+            renderer._draw_saved_paths(state)
+
+        widths = [
+            float(np.max(collection.get_linewidths()))
+            for collection in renderer.ax.collections
+            if len(collection.get_linewidths())
+        ]
+        self.assertIn(7.0, widths)
+        self.assertIn(4.0, widths)
+        selected_collection = next(
+            collection for collection in renderer.ax.collections
+            if len(collection.get_linewidths())
+            and float(np.max(collection.get_linewidths())) == 4.0
+        )
+        self.assertTrue(np.allclose(
+            selected_collection.get_colors()[0, :3],
+            LabelPath.MODE_COLORS["TG"],
+        ))
+        self.assertEqual((renderer.ax.get_xlim(), renderer.ax.get_ylim()), before)
+        plt.close(renderer.fig)
+
+    def test_path_save_writes_independent_user_defined_segment_csv(self):
+        output_dir = LabelPath.os.path.join(
+            LabelPath.os.getcwd(), "tests", "_runtime_path_output",
+        )
+        mode_csv = LabelPath.os.path.join(output_dir, "traj_labeled.csv")
+        path_csv = LabelPath.os.path.join(output_dir, LabelPath.PATH_LABEL_FILENAME)
+        try:
+            pd.DataFrame([{
+                "uid": 7, "idx_o": 3, "idx_d": 4, "mode": "TG",
+            }]).to_csv(mode_csv, index=False)
+            row = pd.Series({
+                "uid": 7, "idx_o": 3, "idx_d": 4, "order": 7, "mode": "",
+                "x_o": 0, "y_o": 0, "z_o": 0,
+                "x_d": 1, "y_d": -1, "z_d": 0,
+            })
+            state = LabelPath.LabelState(row, {(0, 0, 0), (1, -1, 0)})
+            state.apply_move(0)
+            renderer = mock.Mock(
+                labeled_modes={(7, 3): "TG"}, labeled_paths={},
+                labeled_path_modes={}, export_date=None, excluded_uids=set(),
+            )
+            controller = LabelPath.LabelController(
+                state, renderer, output_dir, batch_mode=False, current_idx=0,
+            )
+
+            self.assertEqual(controller._finalize_path("TG"), (7, 1))
+            mode_saved = pd.read_csv(mode_csv, keep_default_na=False)
+            self.assertNotIn("traj", mode_saved.columns)
+            path_saved = pd.read_csv(path_csv, keep_default_na=False).iloc[0]
+            self.assertEqual(path_saved["mode"], "TG")
+            self.assertEqual(int(path_saved["anchor_idx_o"]), 3)
+            self.assertEqual(
+                (int(path_saved["start_x"]), int(path_saved["start_y"]),
+                 int(path_saved["start_z"])),
+                (0, 0, 0),
+            )
+            self.assertEqual(
+                (int(path_saved["end_x"]), int(path_saved["end_y"]),
+                 int(path_saved["end_z"])),
+                (1, -1, 0),
+            )
+            self.assertEqual(
+                json.loads(path_saved["traj"]), [[0, 0, 0], [1, -1, 0]],
+            )
+            self.assertEqual(int(path_saved["steps"]), 1)
+        finally:
+            for csv_path in (mode_csv, path_csv):
+                for suffix in ("", ".tmp"):
+                    target = csv_path + suffix
+                    if LabelPath.os.path.exists(target):
+                        LabelPath.os.remove(target)
+
+    def test_path_redraw_updates_same_segment_id_through_controller(self):
+        output_dir = LabelPath.os.path.join(
+            LabelPath.os.getcwd(), "tests", "_runtime_path_output",
+        )
+        path_csv = LabelPath.os.path.join(output_dir, LabelPath.PATH_LABEL_FILENAME)
+        try:
+            _, segment_key = LabelPath.write_truth_path_segment(
+                output_dir, 7, "TG", 3,
+                [(0, 0, 0), (1, -1, 0)], 1.0, 1,
+            )
+            row = pd.Series({
+                "uid": 7, "idx_o": 8, "idx_d": 9, "order": 7, "mode": "",
+                "x_o": 4, "y_o": -4, "z_o": 0,
+                "x_d": 6, "y_d": -6, "z_d": 0,
+            })
+            state = LabelPath.LabelState(
+                row, {(4, -4, 0), (5, -5, 0), (6, -6, 0)},
+            )
+            self.assertTrue(state.set_path_start((4, -4, 0)))
+            self.assertTrue(state.restore_path([
+                (4, -4, 0), (5, -5, 0), (6, -6, 0),
+            ]))
+            renderer = mock.Mock(
+                labeled_modes={(7, 8): "GG"},
+                labeled_paths={segment_key: [(0, 0, 0), (1, -1, 0)]},
+                labeled_path_modes={segment_key: "TG"},
+                editing_path_key=segment_key,
+                export_date=None, excluded_uids=set(),
+            )
+            controller = LabelPath.LabelController(
+                state, renderer, output_dir, batch_mode=False, current_idx=0,
+            )
+
+            self.assertEqual(controller._finalize_path("GG"), segment_key)
+
+            saved = pd.read_csv(path_csv)
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(int(saved.iloc[0]["segment_id"]), segment_key[1])
+            self.assertEqual(saved.iloc[0]["mode"], "GG")
+            self.assertEqual(int(saved.iloc[0]["anchor_idx_o"]), 8)
+            self.assertEqual(
+                json.loads(saved.iloc[0]["traj"]),
+                [[4, -4, 0], [5, -5, 0], [6, -6, 0]],
+            )
+            self.assertIsNone(renderer.editing_path_key)
+        finally:
+            for suffix in ("", ".tmp"):
+                target = path_csv + suffix
+                if LabelPath.os.path.exists(target):
+                    LabelPath.os.remove(target)
+
+    def test_od_mode_change_does_not_rewrite_independent_path_truth(self):
+        output_dir = LabelPath.os.path.join(
+            LabelPath.os.getcwd(), "tests", "_runtime_path_output",
+        )
+        mode_csv = LabelPath.os.path.join(output_dir, "traj_labeled.csv")
+        path_csv = LabelPath.os.path.join(output_dir, LabelPath.PATH_LABEL_FILENAME)
+        try:
+            traj_df = pd.DataFrame([
+                {"uid": 7, "idx_o": 3, "idx_d": 4, "order": 7, "mode": "",
+                 "x_o": 0, "y_o": 0, "z_o": 0,
+                 "x_d": 1, "y_d": -1, "z_d": 0},
+                {"uid": 7, "idx_o": 4, "idx_d": 5, "order": 7, "mode": "",
+                 "x_o": 1, "y_o": -1, "z_o": 0,
+                 "x_d": 2, "y_d": -2, "z_d": 0},
+            ])
+            pd.DataFrame([
+                {"uid": 7, "idx_o": 3, "idx_d": 4, "mode": "TG"},
+                {"uid": 7, "idx_o": 4, "idx_d": 5, "mode": "TG"},
+            ]).to_csv(mode_csv, index=False)
+            renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+            renderer.traj_df = traj_df
+            renderer.output_dir = output_dir
+            renderer.labeled_modes = {(7, 3): "TG", (7, 4): "TG"}
+            renderer.labeled_paths = {}
+            renderer.labeled_path_modes = {}
+            renderer.ignored_points = set()
+            renderer.excluded_uids = set()
+            renderer.export_date = None
+            renderer._uid_resolved_counts = {7: 2}
+            renderer.refresh_uid_segment_list = mock.Mock()
+            LabelPath.write_truth_path_segment(
+                output_dir, 7, "TG", 3,
+                [(0, 0, 0), (1, -1, 0), (2, -2, 0)], 1.0, 2,
+            )
+            renderer.labeled_paths, renderer.labeled_path_modes = \
+                LabelPath.load_labeled_path_data(output_dir)
+            state = LabelPath.LabelState(traj_df.iloc[1], set())
+            controller = LabelPath.LabelController(
+                state, renderer, output_dir, batch_mode=False, current_idx=1,
+            )
+
+            self.assertTrue(controller._finalize("TG"))
+            self.assertEqual(len(pd.read_csv(path_csv)), 1)
+
+            self.assertTrue(controller._finalize("GG"))
+            changed_modes = pd.read_csv(mode_csv).sort_values("idx_o")
+            self.assertEqual(changed_modes["mode"].tolist(), ["TG", "GG"])
+            saved_path = pd.read_csv(path_csv)
+            self.assertEqual(len(saved_path), 1)
+            self.assertEqual(saved_path.iloc[0]["mode"], "TG")
+            self.assertEqual(
+                json.loads(saved_path.iloc[0]["traj"]),
+                [[0, 0, 0], [1, -1, 0], [2, -2, 0]],
+            )
+        finally:
+            for csv_path in (mode_csv, path_csv):
+                for suffix in ("", ".tmp"):
+                    target = csv_path + suffix
+                    if LabelPath.os.path.exists(target):
+                        LabelPath.os.remove(target)
 
     def test_ignored_current_point_cannot_be_labeled(self):
         state = mock.Mock(

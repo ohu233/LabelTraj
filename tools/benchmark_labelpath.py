@@ -52,7 +52,12 @@ def main():
     labeled, _ = timed(
         "label_load", lambda: LabelPath.load_labeled_modes(LabelPath.DEFAULT_OUTPUT_DIR),
     )
-    multi, _ = timed("road_union", lambda: set().union(*road_sets.values()))
+    multi, _ = timed(
+        "road_union",
+        lambda: set().union(*(
+            road_sets.get(mode, set()) for mode in LabelPath.MODE_LIST
+        )),
+    )
 
     def make_state(index):
         return LabelPath.LabelState(trajectories.iloc[index], multi, hex_grid=grid)

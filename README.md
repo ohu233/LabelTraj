@@ -1,79 +1,88 @@
 # LabelTraj
 
-交互式 hex 路径标注程序。程序将轨迹、hex 路网和离线 OSM 交通地点缓存叠加在同一地图中。
+基于 hex 路网的交互式轨迹标注程序。程序在同一窗口中显示轨迹、离线路网底图、分类路网和 OSM 交通地点，支持 OD 模式标注与独立的真实路径标注。
 
-## OSM 地点数据
-
-先下载长三角 hex 有效范围内的地铁站、火车站和高速收费站：
-
-```powershell
-python download_osm_pois.py
-```
-
-下载器从 `data/hex_cache.npz` 自动取得范围，分块查询 Overpass API，并将结果再次映射到实际有效 hex；外接矩形内但 hex 范围外的地点会被排除。结果保存为 `data/osm_transport_pois.geojson`。标注程序只读取本地缓存，不会在标注过程中访问 Overpass。
-
-若只调整了本项目的分类/去重规则，不需要重新访问 OSM，可对已有缓存重算：
-
-```powershell
-python download_osm_pois.py --normalize-existing
-```
-
-运行标注程序：
+## 启动
 
 ```powershell
 python LabelPath.py
 ```
 
-显示时完整保留当前段前后窗口内的参考点和连接线；hex 路网和交通地点作为辅助背景淡化显示。已经写入当前输出目录
-`traj_labeled.csv` 的参考段，会按 TG/TS/DT/GG/GSD 的路网颜色回显。
-鼠标悬停在主视图的当前起终点或前后轨迹点上时，会显示该点在当前 UID 列表中的序号。
-悬停在其他路网栅格上时，会显示该栅格包含的道路类型，并只列出右侧开关当前处于“开”的
-路网图层。
+程序直接进入第一个未完成 OD，不需要先选择起始位置。连续标注期间复用同一个窗口，切换 OD 不会重新加载全量地图和数据。
 
-程序在连续标注时复用同一个窗口；切换 OD 只重绘当前视图，不会关闭窗口或重新加载全量数据。
+## 模式标注
 
-## 忽略异常采样点
+- 按 `1`—`6` 或点击对应按钮，会立即保存当前 OD 的模式并进入下一条。
+- 键位依次对应 `TG / TS / DT / GG / GSD / Other`。
+- 已标注点使用对应路网颜色显示。
+- 当前 UID 的 OD 进度显示在右侧信息栏；左侧 UID 列表中，已全部处理的 UID 使用实心圆。
 
-在当前 UID 的“点 / OD 列表”中右键某个采样点，可将其忽略；该行会以灰色叉号保留，
-再次右键即可恢复。键盘前后切换和 UID 进度会跳过已忽略点。
+模式真值只写入 `label_output/traj_labeled.csv`，不包含路径字段。
 
-若忽略中间点 B，原来的 A→B 与 B→C 会动态合并为 A→C，时间和距离相加，速度重新计算。
-因为相邻 OD 的含义已经变化，A→B、B→C 的旧标注会从有效文件
-`label_output/traj_labeled.csv` 中直接删除，不再另存失效文件。恢复 B 时同样会让合并后的
-A→C 标注失效，因此 A→B 和 B→C 都需要重新判断。忽略状态保存在
-`label_output/ignored_points.csv`，不会删除原始轨迹数据。
+## 路径标注
 
-重新标注后的有效记录会按 `uid、idx_o、idx_d` 自动插回主 CSV 的正确位置，而不是追加在
-文件末尾。
+点击底部工作流按钮切换到“路径标注”后：
 
-## 排除不需要的 UID 轨迹
+1. 右侧只允许打开一个可标注路网：`TG / TS / DT / GG / GSD`。
+2. 当前唯一打开的路网就是接下来保存路径的真实模式。
+3. 在主视图中第一次左键点击选择真实起点，第二次点击选择真实终点；程序会在当前路网上计算并预览两点间路线。
+4. 按 `Enter` 保存这一条用户定义的真实路径段。
+5. 若点击另一种路网再标注，表示从此处开始切换到了新的模式；未确认的旧路线会自动清空，避免跨路网误连。
 
-在最左侧 UID 列表中右键某个 UID，可将整条轨迹排除；该 UID 会以灰色叉号保留，再次
-右键即可恢复。排除的 UID 会从自动导航和标注输入中跳过，但不会删除主文件
-`label_output/traj_labeled.csv` 中的既有记录。
+路径段边界完全由你选择的起点和终点决定，不会根据 OD 模式序列自动合并或拆分。实际起点、终点也不要求是信令点。保存后保持当前视图，方便继续选择下一段；当前 UID 最近保存的一段会用白色描边重点显示。
 
-程序根据当前数据文件日期持续生成副本，例如
-`label_output/labeled_data_20230917.csv`。该副本始终按 `uid、idx_o、idx_d` 排序，并过滤
-所有已排除 UID；排除状态保存在 `label_output/excluded_uids.csv`。每次标注、忽略采样点、
-排除或恢复 UID 后，副本都会自动更新。
+补充操作：
+
+- `Backspace`：有待确认路线时先清除路线（保留起点）；当前没有临时路线且已在“已标路径”列表中选中一条路径时，删除该条路径记录，并将当前 UID 的剩余路径按原顺序重新编号为 `1…N`。
+- `R`：有临时路线时清空当前起点和路线；否则重置“已标路径”列表中选中的路径，重新选择起终点后按 `Enter` 原位覆盖，不新增编号。
+- `Q/W/E/A/S/D`：对自动路线做小范围手工调整。
+- `L2 二级公路` 仅为显示辅助层，不是可标注模式，因此路径标注时保持关闭。
+
+路径真值独立写入 `label_output/path_labeled.csv`，字段为：
+
+```text
+uid,segment_id,mode,anchor_idx_o,start_x,start_y,start_z,end_x,end_y,end_z,match,steps,traj
+```
+
+其中 `segment_id` 在每个 UID 内按保存顺序递增，`mode` 是保存时唯一打开的路网，`traj` 是完整 hex 路线。修改 OD 模式或忽略采样点不会删除、改写已有路径真值。
+
+## 轨迹与列表交互
+
+- 最左侧 UID 列表支持滚轮浏览和点击切换；右键可排除或恢复整条 UID。
+- UID 列表中的绿色实心圆表示 OD 已全部处理，青色菱形表示该 UID 已经保存过至少一条路径；两种状态互相独立，重启后仍从 CSV 恢复。
+- UID 列表右侧另有“已标路径”列表，只显示当前 UID 的路径。列表支持滚轮浏览；点击一条路径会回到它保存时的 OD 窗口并重点高亮，其他路径淡化显示。选中后可按 `R` 重绘，或按 `Backspace` 删除；正在绘制临时路线时，这两个键只处理临时路线，避免误改已保存记录。
+- UID 右侧的点/OD 列表显示当前 UID 的全部轨迹点，支持滚轮浏览和点击查看。
+- 已标注点的序号前显示对应模式颜色圆点。
+- 在点/OD 列表中右键采样点可忽略，再次右键恢复。忽略中间点后，相邻 OD 会动态合并并要求重新判断。
+- 鼠标悬停主视图轨迹点时显示该点在 UID 内的序号；悬停路网栅格时只显示当前开启的路网类别。
+
+右键排除的 UID 不会从主文件删除，但不会进入按数据日期生成的副本：
+
+- `label_output/labeled_data_20230917.csv`
+- `label_output/path_labeled_20230917.csv`
+
+## OSM 交通地点
+
+下载长三角有效 hex 范围内的地铁站、客运证据优先的火车站和高速收费站：
+
+```powershell
+python download_osm_pois.py
+```
+
+下载结果保存为 `data/osm_transport_pois.geojson`。标注程序只读本地缓存，不会在标注过程中访问 Overpass。若只调整了本项目的分类或去重规则，可复用现有缓存：
+
+```powershell
+python download_osm_pois.py --normalize-existing
+```
+
+默认显示三类地点；可用 `--no-pois` 临时关闭，或用 `--poi-data <path>` 指定其他缓存。地点数据来源为 OpenStreetMap contributors，采用 ODbL 1.0 许可。
 
 ## 离线底图
 
-完整下载并构建当前 hex 范围的离线路网底图：
+提前构建覆盖当前 hex 范围的离线路网底图：
 
 ```powershell
 python download_offline_basemap.py
 ```
 
-源数据保存为 `data/offline_basemap/overture_segments.parquet`，运行时使用
-`data/offline_basemap/tiles/` 下的 50 km 空间分块。只要
-`manifest.json` 存在，标注程序默认优先使用本地底图，不访问网络。可通过环境变量
-`LABELTRAJ_BASEMAP_MODE=offline|auto|online` 显式选择模式。
-
-当前构建覆盖现有 hex 外接范围，并已核对默认轨迹数据的每一个点均有对应本地
-分块。数据来源为 Overture Maps transportation，其中包含 OpenStreetMap 贡献，
-运行界面会保留来源署名。
-
-默认显示三类地点；可用 `--no-pois` 临时关闭，或用 `--poi-data <path>` 指定另一份缓存。地图上的形状/颜色图例区分三类地点，视口地点较少时显示名称；地点密集时将鼠标悬停在标记上可查看名称。光标进入地点所在 hex 后，左下角栅格信息也会列出地点。
-
-数据来源为 OpenStreetMap contributors，采用 ODbL 1.0 许可。建议在需要更新 OSM 数据时重新运行下载命令。
+源数据保存为 `data/offline_basemap/overture_segments.parquet`，运行时使用 `data/offline_basemap/tiles/` 下的空间分块。存在完整 `manifest.json` 时优先使用本地底图，不依赖在线瓦片供应。可通过环境变量 `LABELTRAJ_BASEMAP_MODE=offline|auto|online` 显式选择底图模式。

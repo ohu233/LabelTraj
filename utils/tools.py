@@ -41,7 +41,7 @@ ROAD_BITS = {
 ROAD_LABELS = {
     "TG": "高铁", "TS": "铁路", "DT": "地铁", "GG": "高速",
     "GD": "国道", "SD": "省道", "HL": "环路",
-    "L2": "二级道路", "L3": "三级道路", "L4": "四级道路",
+    "L2": "二级公路", "L3": "三级道路", "L4": "四级道路",
     "QT": "其他道路", "ZJ": "在建", "SL": "水路",
 }
 
@@ -53,10 +53,12 @@ ROAD_LABELS = {
 #   DT   = 地铁
 #   GG   = 高速
 #   GSD  = 国道 + 省道 + 环路（合并）
-# 二级道路(L2) / 三级道路(L3) / 四级道路(L4) / 其他(QT) / 在建(ZJ) / 水路(SL)
+#   L2   = 二级公路（仅辅助显示，默认关闭，不参与路径匹配）
+# 三级道路(L3) / 四级道路(L4) / 其他(QT) / 在建(ZJ) / 水路(SL)
 # 默认不渲染、不参与匹配。
 # ============================================================
 MODE_LIST = ["TG", "TS", "DT", "GG", "GSD"]
+DISPLAY_MODE_LIST = [*MODE_LIST, "L2"]
 
 # 每个 MODE 由哪些细类 bit 合并而成
 MODE_BITS = {
@@ -65,6 +67,7 @@ MODE_BITS = {
     "DT":  ROAD_BITS["DT"],
     "GG":  ROAD_BITS["GG"],
     "GSD": ROAD_BITS["GD"] | ROAD_BITS["SD"] | ROAD_BITS["HL"],
+    "L2":  ROAD_BITS["L2"],
 }
 
 # MODE 的中文标签（合并类合并命名）
@@ -74,6 +77,7 @@ MODE_LABELS = {
     "DT":  "地铁",
     "GG":  "高速",
     "GSD": "国道/省道/环路",
+    "L2":  "二级公路",
 }
 
 # 默认不参与路网渲染与匹配的细类
@@ -83,7 +87,7 @@ EXCLUDED_BITS = (ROAD_BITS["L3"] | ROAD_BITS["L4"] | ROAD_BITS["QT"]
 # 细类代码 → 所属可视化分组（仅含被渲染的细类；未渲染细类不在其中）
 ROAD_KEY_TO_MODE = {
     k: mode
-    for mode in MODE_LIST
+    for mode in DISPLAY_MODE_LIST
     for k, bit in ROAD_BITS.items()
     if MODE_BITS[mode] & bit
 }
@@ -114,9 +118,9 @@ def hex_mapdata_to_road_sets(hex_grid):
     快速构建；否则回退到逐格遍历（兼容旧式 dict）。
 
     Returns:
-        dict: {mode: set((x,y,z), ...)}，键为 MODE_LIST 中的 6 个分组
+        dict: {mode: set((x,y,z), ...)}，键为 DISPLAY_MODE_LIST 中的 6 个分组
     """
-    road_sets = {mode: set() for mode in MODE_LIST}
+    road_sets = {mode: set() for mode in DISPLAY_MODE_LIST}
 
     # 快速路径：HexGridProxy 背后的密集 code 数组（向量化，~1s）
     try:
@@ -132,7 +136,7 @@ def hex_mapdata_to_road_sets(hex_grid):
             xs_all = ixs + x_off
             zs_all = izs + z_off
             ys_all = -xs_all - zs_all
-            for mode in MODE_LIST:
+            for mode in DISPLAY_MODE_LIST:
                 hit = (codes & MODE_BITS[mode]) != 0
                 if hit.any():
                     road_sets[mode] = set(zip(xs_all[hit].tolist(),
@@ -147,7 +151,7 @@ def hex_mapdata_to_road_sets(hex_grid):
         code = int(val.get("code", 0) or 0)
         if not code:
             continue
-        for mode in MODE_LIST:
+        for mode in DISPLAY_MODE_LIST:
             if code & MODE_BITS[mode]:
                 road_sets[mode].add((x, y, z))
     return road_sets
