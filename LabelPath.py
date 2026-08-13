@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.collections import LineCollection
 from matplotlib.patches import FancyBboxPatch, Rectangle
-from matplotlib.widgets import Button
+from matplotlib.widgets import Button, TextBox
 
 # 禁用 matplotlib 默认快捷键，避免与标注操作冲突
 matplotlib.rcParams["keymap.quit"] = []
@@ -1137,6 +1137,7 @@ class PathRenderer:
         self._uid_list_hit_rows = []
         self._uid_nav_offset = 0
         self._uid_nav_hit_rows = []
+        self._uid_search_box = None
         self._path_list_uid = None
         self._path_list_offset = 0
         self._path_list_hit_rows = []
@@ -1169,6 +1170,7 @@ class PathRenderer:
         # Bottom is reserved only for direct mode labels; road switches live in
         # the right-side legend card so the two actions cannot be confused.
         self.fig.subplots_adjust(bottom=0.115)
+        self._init_uid_search_box()
         self._init_road_toggle_buttons()
         self._init_label_buttons()
         self._init_annotation_toggle_button()
@@ -1653,6 +1655,94 @@ class PathRenderer:
                 if 0 <= target < len(self.traj_df):
                     self.segment_select_callback(target)
 
+    def _uid_navigation_group(self, uid):
+        """Return the requested UID-list group in display priority order."""
+        uid = int(uid)
+        if uid in getattr(self, "excluded_uids", set()):
+            return 2
+        total_required = len(self._uid_segment_positions.get(uid, ()))
+        mode_complete = (
+            total_required > 0
+            and getattr(self, "_uid_resolved_counts", {}).get(uid, 0)
+            >= total_required
+        )
+        has_path = getattr(self, "_uid_path_counts", {}).get(uid, 0) > 0
+        if mode_complete and has_path:
+            return 0
+        if mode_complete:
+            return 1
+        return 3
+
+    def _ordered_uid_navigation_values(self):
+        """Sort UID groups, then sort numerically within every group."""
+        uid_values = (
+            int(uid) for uid in getattr(self, "_uid_nav_values", ())
+        )
+        ordered = sorted(
+            set(uid_values),
+            key=lambda uid: (self._uid_navigation_group(uid), uid),
+        )
+        self._uid_nav_values = np.asarray(ordered, dtype=np.int64)
+        self._uid_nav_index = {
+            int(uid): index for index, uid in enumerate(self._uid_nav_values)
+        }
+        return self._uid_nav_values
+
+    def _init_uid_search_box(self):
+        """Create an exact UID search field at the bottom of the UID column."""
+        nav_bbox = self.ax_uid_nav.get_position()
+        search_ax = self.fig.add_axes([
+            nav_bbox.x0 + nav_bbox.width * 0.24,
+            nav_bbox.y0 + nav_bbox.height * 0.012,
+            nav_bbox.width * 0.70,
+            nav_bbox.height * 0.042,
+        ])
+        self._uid_search_box = TextBox(
+            search_ax, "搜索：", initial="",
+            color="#f7f9fb", hovercolor="#ffffff",
+        )
+        self._uid_search_box.label.set_fontsize(7.4)
+        self._uid_search_box.label.set_fontweight("bold")
+        self._uid_search_box.text_disp.set_fontsize(7.4)
+        search_ax.patch.set_edgecolor("#7f8c99")
+        search_ax.patch.set_linewidth(0.9)
+        self._uid_search_box.on_submit(self._search_uid)
+
+    def _search_uid(self, text):
+        """Reveal an exact UID and open its next reviewable OD when possible."""
+        query = str(text).strip()
+        if not query:
+            return
+        try:
+            uid = int(query)
+        except (TypeError, ValueError, OverflowError):
+            print(f"  [UID SEARCH] 无效 UID：{query}")
+            return
+
+        uid_values = self._ordered_uid_navigation_values()
+        if uid not in self._uid_segment_positions:
+            print(f"  [UID SEARCH] 未找到 UID：{uid}")
+            return
+
+        local_index = self._uid_nav_index[uid]
+        max_offset = max(0, len(uid_values) - UID_NAV_VISIBLE_ROWS)
+        self._uid_nav_offset = min(
+            max(0, local_index - UID_NAV_VISIBLE_ROWS // 2), max_offset,
+        )
+        self._draw_uid_navigation_list(ensure_current=False)
+        self.fig.canvas.draw_idle()
+
+        if uid in getattr(self, "excluded_uids", set()):
+            print(f"  [UID SEARCH] UID {uid} 已忽略，可在列表中右键恢复")
+            return
+        target = self._first_unlabeled_position(uid)
+        if target is None:
+            print(f"  [UID SEARCH] UID {uid} 没有可查看的 OD")
+            return
+        print(f"  [UID SEARCH] UID {uid} -> OD #{target}")
+        if target != self.current_idx and self.segment_select_callback is not None:
+            self.segment_select_callback(target)
+
     def _draw_uid_navigation_list(self, ensure_current=False):
         """Draw the scrollable all-UID navigation list at the far left."""
         ax = self.ax_uid_nav
@@ -1662,7 +1752,7 @@ class PathRenderer:
         ax.axis("off")
         self._uid_nav_hit_rows = []
 
-        uid_values = self._uid_nav_values
+        uid_values = self._ordered_uid_navigation_values()
         total = len(uid_values)
         if not total:
             ax.text(0.5, 0.5, "没有可用 UID", ha="center", va="center", fontsize=9)
@@ -1686,7 +1776,7 @@ class PathRenderer:
             transform=ax.transAxes,
         )
 
-        top, bottom = 0.89, 0.055
+        top, bottom = 0.89, 0.120
         row_height = (top - bottom) / UID_NAV_VISIBLE_ROWS
         dot_xs, dot_ys = [], []
         dot_facecolors, dot_edgecolors = [], []
@@ -3640,6 +3730,11 @@ class LabelController:
 
     def on_key(self, event):
         if event.key is None:
+            return
+
+        uid_search_box = getattr(self.renderer, "_uid_search_box", None)
+        if uid_search_box is not None \
+                and getattr(uid_search_box, "capturekeystrokes", False) is True:
             return
 
         key = event.key.lower()

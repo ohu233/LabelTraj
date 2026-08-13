@@ -1062,6 +1062,101 @@ class LabelFeedbackTest(unittest.TestCase):
                             for patch in renderer.ax_uid_nav.patches))
         plt.close(renderer.fig)
 
+    def test_uid_navigation_orders_status_groups_then_numeric_uid(self):
+        renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+        renderer._uid_nav_values = np.asarray(
+            [42, 7, 30, 3, 5, 25, 18], dtype=np.int64,
+        )
+        renderer._uid_segment_positions = {
+            uid: np.asarray([0, 1], dtype=np.int32)
+            for uid in renderer._uid_nav_values
+        }
+        renderer._uid_resolved_counts = {
+            42: 0, 7: 2, 30: 2, 3: 2, 5: 2, 25: 0, 18: 1,
+        }
+        renderer._uid_path_counts = {
+            42: 0, 7: 1, 30: 1, 3: 0, 5: 2, 25: 1, 18: 0,
+        }
+        renderer.excluded_uids = {30}
+
+        ordered = renderer._ordered_uid_navigation_values()
+
+        self.assertEqual(
+            ordered.tolist(),
+            [5, 7, 3, 30, 18, 25, 42],
+        )
+        self.assertEqual(
+            renderer._uid_nav_index,
+            {5: 0, 7: 1, 3: 2, 30: 3, 18: 4, 25: 5, 42: 6},
+        )
+
+        # Once UID 3 receives a path it moves into the first group, where
+        # numeric UID order is still preserved.
+        renderer._uid_path_counts[3] = 1
+        self.assertEqual(
+            renderer._ordered_uid_navigation_values().tolist(),
+            [3, 5, 7, 30, 18, 25, 42],
+        )
+
+    def test_uid_search_opens_first_unlabeled_od_and_reveals_ignored_uid(self):
+        traj_df = pd.DataFrame([
+            {"uid": 10, "idx_o": 0},
+            {"uid": 10, "idx_o": 1},
+            {"uid": 20, "idx_o": 0},
+            {"uid": 20, "idx_o": 1},
+            {"uid": 30, "idx_o": 0},
+        ])
+        renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+        renderer.fig = mock.Mock()
+        renderer.traj_df = traj_df
+        renderer.state = mock.Mock(uid=10)
+        renderer.current_idx = 0
+        renderer.annotation_mode = LabelPath.ANNOTATION_MODE
+        renderer.labeled_modes = {(20, 0): "TG"}
+        renderer.ignored_points = set()
+        renderer.excluded_uids = {30}
+        renderer._uid_segment_positions = {
+            10: np.asarray([0, 1]),
+            20: np.asarray([2, 3]),
+            30: np.asarray([4]),
+        }
+        renderer._uid_nav_values = np.asarray([30, 20, 10])
+        renderer._uid_nav_index = {30: 0, 20: 1, 10: 2}
+        renderer._uid_resolved_counts = {10: 0, 20: 1, 30: 0}
+        renderer._uid_path_counts = {10: 0, 20: 0, 30: 0}
+        renderer._uid_nav_offset = 0
+        renderer._draw_uid_navigation_list = mock.Mock()
+        renderer.segment_select_callback = mock.Mock()
+
+        renderer._search_uid("20")
+
+        renderer.segment_select_callback.assert_called_once_with(3)
+        renderer._draw_uid_navigation_list.assert_called_with(ensure_current=False)
+
+        renderer.segment_select_callback.reset_mock()
+        renderer._search_uid("30")
+        renderer.segment_select_callback.assert_not_called()
+        self.assertEqual(renderer._uid_nav_index[30], 0)
+
+    def test_uid_search_box_is_labeled_and_blocks_annotation_shortcuts(self):
+        renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
+        renderer.fig, renderer.ax_uid_nav = plt.subplots()
+        renderer._uid_search_box = None
+
+        renderer._init_uid_search_box()
+
+        self.assertEqual(renderer._uid_search_box.label.get_text(), "搜索：")
+        renderer._uid_search_box.capturekeystrokes = True
+        state = mock.Mock(path_history=[])
+        controller = LabelPath.LabelController(
+            state, renderer, "unused", batch_mode=True, current_idx=0,
+            navigate_callback=mock.Mock(),
+        )
+        with mock.patch.object(controller, "save_mode") as save_mode:
+            controller.on_key(mock.Mock(key="1"))
+        save_mode.assert_not_called()
+        plt.close(renderer.fig)
+
     def test_uid_navigation_scrolls_and_opens_first_unlabeled_od(self):
         traj_df = pd.DataFrame([
             {"uid": uid, "idx_o": 0} for uid in range(40)
