@@ -1659,19 +1659,21 @@ class PathRenderer:
         """Return the requested UID-list group in display priority order."""
         uid = int(uid)
         if uid in getattr(self, "excluded_uids", set()):
-            return 2
+            return 3
         total_required = len(self._uid_segment_positions.get(uid, ()))
+        resolved_count = getattr(self, "_uid_resolved_counts", {}).get(uid, 0)
         mode_complete = (
             total_required > 0
-            and getattr(self, "_uid_resolved_counts", {}).get(uid, 0)
-            >= total_required
+            and resolved_count >= total_required
         )
         has_path = getattr(self, "_uid_path_counts", {}).get(uid, 0) > 0
         if mode_complete and has_path:
             return 0
         if mode_complete:
             return 1
-        return 3
+        if resolved_count > 0 or has_path:
+            return 2
+        return 4
 
     def _ordered_uid_navigation_values(self):
         """Sort UID groups, then sort numerically within every group."""

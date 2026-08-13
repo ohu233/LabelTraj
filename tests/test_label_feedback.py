@@ -1083,19 +1083,23 @@ class LabelFeedbackTest(unittest.TestCase):
 
         self.assertEqual(
             ordered.tolist(),
-            [5, 7, 3, 30, 18, 25, 42],
+            [5, 7, 3, 18, 25, 30, 42],
         )
         self.assertEqual(
             renderer._uid_nav_index,
-            {5: 0, 7: 1, 3: 2, 30: 3, 18: 4, 25: 5, 42: 6},
+            {5: 0, 7: 1, 3: 2, 18: 3, 25: 4, 30: 5, 42: 6},
         )
+        self.assertEqual(renderer._uid_navigation_group(18), 2)
+        self.assertEqual(renderer._uid_navigation_group(25), 2)
+        self.assertEqual(renderer._uid_navigation_group(30), 3)
+        self.assertEqual(renderer._uid_navigation_group(42), 4)
 
         # Once UID 3 receives a path it moves into the first group, where
         # numeric UID order is still preserved.
         renderer._uid_path_counts[3] = 1
         self.assertEqual(
             renderer._ordered_uid_navigation_values().tolist(),
-            [3, 5, 7, 30, 18, 25, 42],
+            [3, 5, 7, 18, 25, 30, 42],
         )
 
     def test_uid_search_opens_first_unlabeled_od_and_reveals_ignored_uid(self):
@@ -1136,7 +1140,7 @@ class LabelFeedbackTest(unittest.TestCase):
         renderer.segment_select_callback.reset_mock()
         renderer._search_uid("30")
         renderer.segment_select_callback.assert_not_called()
-        self.assertEqual(renderer._uid_nav_index[30], 0)
+        self.assertEqual(renderer._uid_nav_index[30], 1)
 
     def test_uid_search_box_is_labeled_and_blocks_annotation_shortcuts(self):
         renderer = LabelPath.PathRenderer.__new__(LabelPath.PathRenderer)
